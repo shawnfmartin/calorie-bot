@@ -1,0 +1,16 @@
+# systemd *user* service: runs as you, no root needed.
+[Unit]
+Description=Telegram calorie tracker bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=__DIR__
+EnvironmentFile=__DIR__/.env
+ExecStart=__DIR__/.venv/bin/python -m calorie_bot.bot
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=default.target

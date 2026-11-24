@@ -1,0 +1,14 @@
+# Secrets: the real .env lives on the Pi
+.env
+.env.*
+!.env.example
+
+# Local data
+data/
+*.db
+
+# Python
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
