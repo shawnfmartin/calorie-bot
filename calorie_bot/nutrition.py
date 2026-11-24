@@ -67,14 +67,20 @@ the recipe's exact numbers. For items that are not a saved recipe, set `recipe` 
 three amounts to 0.
 
 Set `intent` to exactly one of:
-- "log_meal": the user is telling you what they ate or drank. Fill `items`.
+- "log_meal": the user is telling you what they ate or drank. Fill `items` and set `meal` (below).
 - "correct_log": the user is fixing something already in today's log ("actually it was 2 eggs,
   not 3", "the rice was 150g"). Put the ids of the log entries being replaced in `entry_ids` and
-  the corrected food in `items` (only the corrected entries, not the rest of the meal).
+  the corrected food in `items` (only the corrected entries, not the rest of the meal). Set `meal`
+  only if they also say which meal it belongs to; otherwise "".
+- "move_entries": the user wants entries moved to another meal ("the arugula was dinner", "move
+  the eggs to breakfast"). Put their ids in `entry_ids` and the new meal in `meal`.
 - "delete_entries": the user wants entries removed from today's log ("remove the arugula",
   "delete lunch", "I didn't eat the toast"). Put their ids in `entry_ids`.
 - "undo_last": the user wants to undo the last meal they logged ("undo", "scratch that").
-- "show_today": the user wants to see what they ate today or how many calories they have left.
+- "show_day": the user wants to see what they ate, or how many calories they have left, on a day
+  or at one meal ("what did I have for lunch today?", "what did I eat yesterday?"). Set
+  `day_offset` (0 today, -1 yesterday, -2 the day before, up to -30) and `meal` to the meal
+  they asked about, or "" for the whole day.
 - "show_week": the user wants to see the last few days or their weekly progress.
 - "set_goal": the user is setting, changing, clearing or asking about their daily calorie goal.
   Put the new goal in `goal_kcal`; -1 to clear it; 0 if they are only asking what it is.
@@ -96,8 +102,13 @@ Set `intent` to exactly one of:
 - "help": the user is asking what the bot can do or how to use it.
 - "other": anything else (a greeting, a question, something unrelated). Put a short helpful reply
   in `note`.
+Meals: `meal` is one of "breakfast", "lunch", "dinner", "snack". When logging, use the meal the
+user names ("for lunch", "dinner was...", "a snack"); otherwise pick it from the current time,
+which is given with the message: before 11:00 breakfast, 11:00 to 16:00 lunch, 16:00 to 22:00
+dinner, otherwise snack. Something eaten between meals that they call a snack is a snack.
+
 Only fill the fields an intent uses. Leave the rest empty: `items` [], `entry_ids` [],
-`goal_kcal` 0, `rename_to` "", and `recipe` with an empty name, no ingredients and zeros (except
+`goal_kcal` 0, `meal` "", `day_offset` 0, `rename_to` "", and `recipe` with an empty name, no ingredients and zeros (except
 `recipe.name` where described above).
 
 Recipe rules:
@@ -131,7 +142,8 @@ _RECIPE_PROPS = {
 }
 _RECIPE_KEYS = list(_RECIPE_PROPS)
 
-INTENTS = ["log_meal", "correct_log", "delete_entries", "undo_last", "show_today", "show_week",
+INTENTS = ["log_meal", "correct_log", "move_entries", "delete_entries", "undo_last", "show_day",
+           "show_week",
            "set_goal", "save_recipe", "update_recipe", "rename_recipe", "show_recipe",
            "list_recipes", "delete_recipe", "help", "other"]
 
@@ -158,12 +170,15 @@ MEAL_SCHEMA = {
         "intent": {"type": "string", "enum": INTENTS},
         "entry_ids": {"type": "array", "items": {"type": "integer"}},
         "goal_kcal": {"type": "number"},
+        "meal": {"type": "string", "enum": ["breakfast", "lunch", "dinner", "snack", ""]},
+        "day_offset": {"type": "integer"},
         "rename_to": {"type": "string"},
         "recipe": {"type": "object", "properties": _RECIPE_PROPS, "required": _RECIPE_KEYS,
                    "additionalProperties": False},
         "note": {"type": "string"},
     },
-    "required": ["intent", "items", "entry_ids", "goal_kcal", "recipe", "rename_to", "note"],
+    "required": ["intent", "items", "entry_ids", "goal_kcal", "meal", "day_offset", "recipe",
+                 "rename_to", "note"],
     "additionalProperties": False,
 }
 
@@ -175,7 +190,8 @@ class EstimateError(Exception):
 
 
 def meal_prompt(text: str | None, recipe_names: list[str] | None,
-                history: list[str] | None = None, today_log: list[str] | None = None) -> str:
+                history: list[str] | None = None, today_log: list[str] | None = None,
+                now: str | None = None) -> str:
     prompt = ""
     if history:
         prompt += "Recent messages, oldest first (context only):\n" + "\n".join(history) + "\n\n"
@@ -183,8 +199,10 @@ def meal_prompt(text: str | None, recipe_names: list[str] | None,
     prompt += text or "Here's a photo of what I ate."
     if recipe_names:
         prompt += "\n\nMy saved recipes: " + "; ".join(recipe_names)
+    if now:
+        prompt += f"\n\nCurrent time: {now}"
     if today_log:
-        prompt += "\n\nToday's log (id, time, item, kcal):\n" + "\n".join(today_log)
+        prompt += "\n\nToday's log (id, time, meal, item, kcal):\n" + "\n".join(today_log)
     return prompt
 
 
@@ -195,9 +213,9 @@ class _Estimator:
                        image_type: str = "image/jpeg",
                        recipe_names: list[str] | None = None,
                        history: list[str] | None = None,
-                       today_log: list[str] | None = None) -> dict:
+                       today_log: list[str] | None = None, now: str | None = None) -> dict:
         return await self._structured(
-            MEAL_PROMPT, MEAL_SCHEMA, meal_prompt(text, recipe_names, history, today_log),
+            MEAL_PROMPT, MEAL_SCHEMA, meal_prompt(text, recipe_names, history, today_log, now),
             image, image_type)
 
     async def _structured(self, system: str, schema: dict, prompt: str,

@@ -20,7 +20,8 @@ CREATE TABLE IF NOT EXISTS entries (
     protein_g   REAL    NOT NULL DEFAULT 0,
     carbs_g     REAL    NOT NULL DEFAULT 0,
     fat_g       REAL    NOT NULL DEFAULT 0,
-    meal_id     TEXT    NOT NULL           -- groups items from one message
+    meal_id     TEXT    NOT NULL,          -- groups items from one message
+    meal        TEXT                       -- breakfast, lunch, dinner or snack
 );
 CREATE INDEX IF NOT EXISTS idx_entries_user_time ON entries (user_id, eaten_at);
 
@@ -58,6 +59,29 @@ class Entry:
     carbs_g: float
     fat_g: float
     meal_id: str
+    meal: str = "snack"
+
+
+MEALS = ("breakfast", "lunch", "dinner", "snack")
+
+
+def meal_for_time(when: datetime) -> str:
+    """The meal a time of day most likely belongs to, when the user doesn't say."""
+    h = when.hour
+    if 4 <= h < 11:
+        return "breakfast"
+    if 11 <= h < 16:
+        return "lunch"
+    if 16 <= h < 22:
+        return "dinner"
+    return "snack"
+
+
+def meal_in_text(text: str) -> str | None:
+    """'...for breakfast' -> 'breakfast'. Used to fill in entries saved before meals existed."""
+    lowered = (text or "").lower()
+    found = [m for m in MEALS if m in lowered]
+    return found[0] if len(found) == 1 else None
 
 
 MACROS = ("calories", "protein_g", "carbs_g", "fat_g")
@@ -104,21 +128,47 @@ class Store:
         self.conn = sqlite3.connect(str(path))
         self.conn.row_factory = sqlite3.Row
         self.conn.executescript(SCHEMA)
+        self._migrate()
         self.conn.commit()
+
+    def _migrate(self) -> None:
+        """Bring databases made by older versions up to date."""
+        columns = {r["name"] for r in self.conn.execute("PRAGMA table_info(entries)")}
+        if "meal" not in columns:
+            self.conn.execute("ALTER TABLE entries ADD COLUMN meal TEXT")
+        # Entries from before meals existed: what the user wrote, else the time of day.
+        rows = self.conn.execute(
+            "SELECT id, eaten_at, description FROM entries WHERE meal IS NULL").fetchall()
+        for r in rows:
+            local = datetime.fromisoformat(r["eaten_at"]).astimezone(self.tz)
+            meal = meal_in_text(r["description"]) or meal_for_time(local)
+            self.conn.execute("UPDATE entries SET meal=? WHERE id=?", (meal, r["id"]))
 
     # ---- writes -----------------------------------------------------------
 
     def add_items(self, user_id: int, description: str, items: list[dict],
-                  meal_id: str, eaten_at: datetime | None = None) -> None:
-        ts = (eaten_at or datetime.now(self.tz)).astimezone(ZoneInfo("UTC")).isoformat(timespec="seconds")
+                  meal_id: str, eaten_at: datetime | None = None, meal: str | None = None) -> None:
+        when = eaten_at or datetime.now(self.tz)
+        meal = meal if meal in MEALS else meal_for_time(when.astimezone(self.tz))
+        ts = when.astimezone(ZoneInfo("UTC")).isoformat(timespec="seconds")
         self.conn.executemany(
             "INSERT INTO entries (user_id, eaten_at, description, item, calories,"
-            " protein_g, carbs_g, fat_g, meal_id) VALUES (?,?,?,?,?,?,?,?,?)",
+            " protein_g, carbs_g, fat_g, meal_id, meal) VALUES (?,?,?,?,?,?,?,?,?,?)",
             [(user_id, ts, description, i["item"], int(round(i["calories"])),
-              i.get("protein_g", 0), i.get("carbs_g", 0), i.get("fat_g", 0), meal_id)
+              i.get("protein_g", 0), i.get("carbs_g", 0), i.get("fat_g", 0), meal_id, meal)
              for i in items],
         )
         self.conn.commit()
+
+    def set_meal(self, user_id: int, entry_ids: list[int], meal: str) -> list[Entry]:
+        """Move entries to another meal. Returns the entries that moved."""
+        if meal not in MEALS or not entry_ids:
+            return []
+        marks = ",".join("?" * len(entry_ids))
+        self.conn.execute(f"UPDATE entries SET meal=? WHERE user_id=? AND id IN ({marks})",
+                          (meal, user_id, *entry_ids))
+        self.conn.commit()
+        return self._fetch(f"WHERE user_id=? AND id IN ({marks})", (user_id, *entry_ids))
 
     def undo_last_meal(self, user_id: int) -> list[Entry]:
         row = self.conn.execute(
@@ -249,8 +299,8 @@ class Store:
 
     def _fetch(self, where: str, params: tuple) -> list[Entry]:
         rows = self.conn.execute(
-            "SELECT id, eaten_at, item, calories, protein_g, carbs_g, fat_g, meal_id"
+            "SELECT id, eaten_at, item, calories, protein_g, carbs_g, fat_g, meal_id, meal"
             f" FROM entries {where} ORDER BY eaten_at, id", params).fetchall()
         return [Entry(r["id"], datetime.fromisoformat(r["eaten_at"]).astimezone(self.tz),
                       r["item"], r["calories"], r["protein_g"], r["carbs_g"], r["fat_g"],
-                      r["meal_id"]) for r in rows]
+                      r["meal_id"], r["meal"] or "snack") for r in rows]

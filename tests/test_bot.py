@@ -547,3 +547,82 @@ def test_unrelated_message_cancels_pending_delete(tmp_path):
     chat.say("today")                                         # something else in between
     chat.say("yes", claude_says("other", note="Yes to what?"))
     assert chat.store.get_recipe(1, "chili") is not None      # "yes" no longer deletes
+
+
+# ---- meals ------------------------------------------------------------------------
+
+import sqlite3  # noqa: E402
+
+from calorie_bot.db import meal_for_time, meal_in_text  # noqa: E402
+
+
+def food(name, kcal):
+    return {**item(name, kcal), "recipe": "", "recipe_grams": 0, "recipe_servings": 0,
+            "recipe_fraction": 0}
+
+
+@pytest.mark.parametrize("hour,meal", [(3, "snack"), (7, "breakfast"), (12, "lunch"),
+                                       (18, "dinner"), (23, "snack")])
+def test_meal_for_time(hour, meal):
+    assert meal_for_time(datetime(2026, 11, 24, hour, 0, tzinfo=TZ)) == meal
+
+
+def test_meal_in_text():
+    assert meal_in_text("3 eggs for breakfast") == "breakfast"
+    assert meal_in_text("Add 33 servings to lunch along with 59g arugula") == "lunch"
+    assert meal_in_text("breakfast and lunch") is None and meal_in_text("2 eggs") is None
+
+
+def test_old_database_gets_meals_filled_in(tmp_path):
+    path = tmp_path / "old.db"
+    old = sqlite3.connect(path)  # the schema before meals existed
+    old.executescript("""CREATE TABLE entries (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER
+        NOT NULL, eaten_at TEXT NOT NULL, description TEXT NOT NULL, item TEXT NOT NULL, calories
+        INTEGER NOT NULL, protein_g REAL NOT NULL DEFAULT 0, carbs_g REAL NOT NULL DEFAULT 0,
+        fat_g REAL NOT NULL DEFAULT 0, meal_id TEXT NOT NULL);""")
+    old.executemany("INSERT INTO entries (user_id, eaten_at, description, item, calories, meal_id)"
+                    " VALUES (1, ?, ?, ?, ?, 'm')",
+                    [("2026-11-24T19:42:39+00:00", "3 eggs for breakfast", "eggs", 215),   # 11:42, but text says breakfast
+                     ("2026-11-24T20:10:04+00:00", "33 servings to lunch", "dressing", 29),
+                     ("2026-11-25T02:30:00+00:00", "steak", "steak", 600)])             # 18:30 in Los Angeles
+    old.commit(); old.close()
+    s = Store(path, TZ)
+    rows = s._fetch("WHERE user_id=1", ())
+    assert [e.meal for e in rows] == ["breakfast", "lunch", "dinner"]
+    Store(path, TZ)  # opening again is harmless
+
+
+def test_day_view_grouped_by_meal_and_meal_questions(tmp_path):
+    s = Store(tmp_path / "t.db", TZ)
+    s.add_items(1, "x", [item("eggs", 143)], "a", meal="breakfast")
+    s.add_items(1, "x", [item("salad", 15), item("dressing", 29)], "b", meal="lunch")
+    s.add_items(1, "x", [item("pasta", 700)], "c", datetime.now(TZ) - timedelta(days=1), meal="dinner")
+    from calorie_bot.bot import day_text
+    today = day_text(s, 1)
+    assert today.index("Breakfast") < today.index("Lunch") and "Dinner" not in today
+    assert "<b>Lunch</b> — 44 kcal" in today and "Today:</b> 187 kcal" in today
+    lunch = day_text(s, 1, 0, "lunch")
+    assert "salad" in lunch and "eggs" not in lunch
+    assert day_text(s, 1, 0, "dinner") == "Nothing logged for dinner today."
+    assert "pasta" in day_text(s, 1, -1, "dinner")
+    assert "Total:</b> 700 kcal" in day_text(s, 1, -1)
+
+
+def test_logging_uses_meal_and_corrections_keep_it(tmp_path):
+    chat = Chat(tmp_path)
+    assert "Logged for lunch" in chat.say("salad for lunch", claude_says(
+        "log_meal", meal="lunch", items=[food("salad", 120)]))
+    assert chat.claude.calls[-1]["now"]                         # Claude was told the time
+    salad = chat.store.entries_for_day(1, chat.store.today())[0]
+    assert salad.meal == "lunch"
+    chat.say("actually a big salad", claude_says("correct_log", entry_ids=[salad.id],
+                                                 items=[food("big salad", 200)]))
+    [fixed] = chat.store.entries_for_day(1, chat.store.today())
+    assert fixed.meal == "lunch"                                  # correction kept the meal
+    assert "Moved big salad to dinner" in chat.say("that was dinner", claude_says(
+        "move_entries", entry_ids=[fixed.id], meal="dinner"))
+    assert chat.store.entries_for_day(1, chat.store.today())[0].meal == "dinner"
+    assert "big salad" in chat.say("what did i have for dinner", claude_says(
+        "show_day", meal="dinner"))
+    assert "Nothing logged for lunch today" in chat.say("and lunch?", claude_says(
+        "show_day", meal="lunch"))

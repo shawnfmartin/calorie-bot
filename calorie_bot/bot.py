@@ -16,13 +16,14 @@ import re
 import time
 import uuid
 from collections import deque
+from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
 from telegram import Update
 from telegram.constants import ChatAction, ParseMode
 from telegram.ext import Application, ContextTypes, MessageHandler, filters
 
-from .db import Entry, Recipe, Store
+from .db import MEALS, Entry, Recipe, Store, meal_for_time
 from .nutrition import EstimateError, make_estimator
 
 log = logging.getLogger("calorie_bot")
@@ -30,9 +31,12 @@ log = logging.getLogger("calorie_bot")
 HELP = """<b>Calorie tracker</b>
 Just talk to me. Some things you can say:
 
-🍽 <i>2 eggs, toast with butter and a latte</i>, or send a photo of your meal
-📋 <i>what did I eat today?</i> · <i>how did I do this week?</i>
-✏️ <i>actually it was 2 eggs, not 3</i> · <i>remove the toast</i> · <i>undo</i>
+🍽 <i>2 eggs and toast for breakfast</i>, or send a photo of your meal
+   (no meal named? I go by the time of day)
+📋 <i>what did I eat today?</i> · <i>what did I have for lunch?</i> · <i>dinner yesterday?</i>
+   · <i>how did I do this week?</i>
+✏️ <i>actually it was 2 eggs, not 3</i> · <i>remove the toast</i> · <i>the arugula was dinner</i>
+   · <i>undo</i>
 🎯 <i>set my goal to 2000</i> · <i>what's my goal?</i>
 
 📖 <b>Recipes</b>
@@ -70,15 +74,57 @@ def macro_line(entries: list[Entry]) -> str:
     return f"P {p:.0f}g · C {c:.0f}g · F {f:.0f}g"
 
 
-def today_text(store: Store, user_id: int) -> str:
-    entries = store.entries_for_day(user_id, store.today())
+MEAL_ICONS = {"breakfast": "🍳", "lunch": "🥗", "dinner": "🍝", "snack": "🍎"}
+
+
+def day_name(store: Store, offset: int) -> str:
+    if offset == 0:
+        return "today"
+    if offset == -1:
+        return "yesterday"
+    return f"{store.today() + timedelta(days=offset):%A %b %-d}"
+
+
+def meal_block(meal: str, entries: list[Entry]) -> list[str]:
+    total = sum(e.calories for e in entries)
+    lines = [f"{MEAL_ICONS[meal]} <b>{meal.capitalize()}</b> — {fmt_kcal(total)} kcal"]
+    lines += [f"   • {html.escape(e.item)} — {fmt_kcal(e.calories)}" for e in entries]
+    return lines
+
+
+def day_text(store: Store, user_id: int, offset: int = 0, meal: str = "") -> str:
+    """One day's log grouped by meal, or just one meal of it."""
+    offset = max(-30, min(0, offset))
+    day = store.today() + timedelta(days=offset)
+    entries = store.entries_for_day(user_id, day)
+    when = day_name(store, offset)
+
+    if meal in MEALS:
+        picked = [e for e in entries if e.meal == meal]
+        if not picked:
+            return f"Nothing logged for {meal} {when}."
+        lines = meal_block(meal, picked) + ["", macro_line(picked)]
+        return "\n".join(lines)
+
     if not entries:
-        return "Nothing logged today yet. Tell me what you ate."
-    lines = [f"<b>{store.today():%A %b %-d}</b>"]
-    for e in entries:
-        lines.append(f"{e.eaten_at:%H:%M}  {html.escape(e.item)} — {fmt_kcal(e.calories)}")
-    lines += ["", day_summary(store, user_id), macro_line(entries)]
+        return f"Nothing logged {when} yet. Tell me what you ate." if offset == 0 else \
+               f"Nothing logged {when}."
+    lines = [f"<b>{day:%A %b %-d}</b>"]
+    for m in MEALS:
+        picked = [e for e in entries if e.meal == m]
+        if picked:
+            lines += [""] + meal_block(m, picked)
+    lines.append("")
+    if offset == 0:
+        lines.append(day_summary(store, user_id))
+    else:
+        lines.append(f"<b>Total:</b> {fmt_kcal(sum(e.calories for e in entries))} kcal")
+    lines.append(macro_line(entries))
     return "\n".join(lines)
+
+
+def today_text(store: Store, user_id: int) -> str:
+    return day_text(store, user_id, 0)
 
 
 def week_text(store: Store, user_id: int) -> str:
@@ -98,7 +144,7 @@ def week_text(store: Store, user_id: int) -> str:
 
 
 def today_log_for_claude(store: Store, user_id: int) -> list[str]:
-    return [f"#{e.id} {e.eaten_at:%H:%M} {e.item} ({fmt_kcal(e.calories)} kcal)"
+    return [f"#{e.id} {e.eaten_at:%H:%M} {e.meal}: {e.item} ({fmt_kcal(e.calories)} kcal)"
             for e in store.entries_for_day(user_id, store.today())]
 
 
@@ -215,7 +261,8 @@ async def claude_reply(update, ctx, msg, store: Store, user_id: int, text: str,
         result = await estimator.estimate(
             text=text or None, image=image,
             recipe_names=[recipe_label(r) for r in store.list_recipes(user_id)],
-            history=history, today_log=today_log_for_claude(store, user_id))
+            history=history, today_log=today_log_for_claude(store, user_id),
+            now=f"{datetime.now(store.tz):%A %H:%M}")
     except EstimateError as e:
         await msg.reply_text(f"⚠️ {e}")
         return
@@ -227,6 +274,7 @@ async def claude_reply(update, ctx, msg, store: Store, user_id: int, text: str,
     recipe_out = result.get("recipe") or {}
     recipe_name = (recipe_out.get("name") or "").strip()
     entry_ids = [int(i) for i in result.get("entry_ids") or []]
+    meal = result.get("meal") or ""
     log.info("intent=%s", intent)
 
     if intent == "save_recipe" and recipe_out.get("ingredients"):
@@ -243,8 +291,11 @@ async def claude_reply(update, ctx, msg, store: Store, user_id: int, text: str,
         await recipes_reply(msg, store, user_id)
     elif intent == "delete_recipe":
         await ask_delete_recipe(msg, store, user_id, recipe_name, ctx.bot_data["pending_delete"])
-    elif intent == "show_today":
-        await today_reply(msg, store, user_id)
+    elif intent in ("show_day", "show_today"):
+        await msg.reply_text(day_text(store, user_id, int(result.get("day_offset") or 0), meal),
+                             parse_mode=ParseMode.HTML)
+    elif intent == "move_entries":
+        await move_entries_reply(msg, store, user_id, entry_ids, meal)
     elif intent == "show_week":
         await week_reply(msg, store, user_id)
     elif intent == "undo_last":
@@ -257,7 +308,7 @@ async def claude_reply(update, ctx, msg, store: Store, user_id: int, text: str,
         await help_reply(msg, store, user_id)
     elif intent in ("log_meal", "correct_log") and result.get("items"):
         await log_items_reply(msg, store, user_id, result["items"], note, text or "photo",
-                              replace_ids=entry_ids if intent == "correct_log" else [])
+                              replace_ids=entry_ids if intent == "correct_log" else [], meal=meal)
     else:
         await msg.reply_text(note or "I couldn't find any food in that. Try e.g. "
                              "“a turkey sandwich and an apple”, or ask me for help.")
@@ -288,7 +339,8 @@ def apply_recipes(store: Store, user_id: int,
 
 
 async def log_items_reply(msg, store: Store, user_id: int, items: list[dict], note: str,
-                          description: str, replace_ids: list[int] | None = None) -> None:
+                          description: str, replace_ids: list[int] | None = None,
+                          meal: str = "") -> None:
     items, from_recipe, warnings = apply_recipes(store, user_id, items)
 
     replaced: list[Entry] = []
@@ -296,16 +348,22 @@ async def log_items_reply(msg, store: Store, user_id: int, items: list[dict], no
         entry = store.delete_entry(user_id, entry_id)
         if entry:
             replaced.append(entry)
-    # A correction keeps the original time, so it stays on the right day.
+    # A correction keeps the original time and meal, so it stays where it was.
     eaten_at = min(e.eaten_at for e in replaced) if replaced else None
-    store.add_items(user_id, description, items, meal_id=uuid.uuid4().hex, eaten_at=eaten_at)
+    if replaced and meal not in MEALS:
+        meal = replaced[0].meal
+    if meal not in MEALS:
+        meal = meal_for_time(datetime.now(store.tz))
+    store.add_items(user_id, description, items, meal_id=uuid.uuid4().hex, eaten_at=eaten_at,
+                    meal=meal)
 
     lines = []
     if replaced:
         lines.append("✏️ <b>Fixed</b>")
         lines += [f"• <s>{html.escape(e.item)} — {fmt_kcal(e.calories)} kcal</s>" for e in replaced]
     else:
-        lines.append("🍽 <b>Logged</b>")
+        label = "as a snack" if meal == "snack" else f"for {meal}"
+        lines.append(f"{MEAL_ICONS[meal]} <b>Logged {label}</b>")
     lines += [f"• {'📖 ' if used else ''}{html.escape(i['item'])} — {fmt_kcal(i['calories'])} kcal"
               for i, used in zip(items, from_recipe)]
     if len(items) > 1:
@@ -315,6 +373,19 @@ async def log_items_reply(msg, store: Store, user_id: int, items: list[dict], no
     lines += [f"⚠️ {html.escape(w)}" for w in warnings]
     lines += ["", day_summary(store, user_id)]
     await msg.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
+
+
+async def move_entries_reply(msg, store: Store, user_id: int, entry_ids: list[int],
+                             meal: str) -> None:
+    moved = store.set_meal(user_id, entry_ids, meal)
+    if not moved:
+        await msg.reply_text("I couldn't tell which entry to move, or to which meal. "
+                             "Here's today so far:\n\n" + today_text(store, user_id),
+                             parse_mode=ParseMode.HTML)
+        return
+    names = ", ".join(html.escape(e.item) for e in moved)
+    where = "snacks" if meal == "snack" else meal
+    await msg.reply_text(f"{MEAL_ICONS[meal]} Moved {names} to {where}.", parse_mode=ParseMode.HTML)
 
 
 async def delete_entries_reply(msg, store: Store, user_id: int, entry_ids: list[int]) -> None:

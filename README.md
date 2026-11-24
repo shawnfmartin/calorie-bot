@@ -29,6 +29,8 @@ There are no commands. Everything is a plain message:
 |---|---|
 | Log food | *"2 eggs and toast for breakfast"*, or send a photo |
 | See today | *"what did I eat today?"*, *"how many calories left?"* |
+| Ask about a meal | *"what did I have for lunch today?"*, *"dinner yesterday?"* |
+| Move to another meal | *"the salad was actually dinner"* |
 | See the week | *"how did I do this week?"* |
 | Fix an entry | *"actually it was 2 eggs, not 3"*, *"the rice was 150g"* |
 | Remove an entry | *"remove the toast"*, *"undo"* |
@@ -36,6 +38,22 @@ There are no commands. Everything is a plain message:
 | Save a recipe | *"save this as my vinaigrette:"* and the ingredients |
 | Manage recipes | *"show my recipes"*, *"show the vinaigrette"*, *"rename it to …"*, *"delete the chili recipe"* |
 | Get help | *"help"* |
+
+**Meals:** every entry belongs to breakfast, lunch, dinner or a snack. Say which (*"for
+lunch"*, *"as a snack"*), or the bot goes by the time of day: before 11:00 breakfast, 11:00
+to 16:00 lunch, 16:00 to 22:00 dinner, otherwise a snack. "Today" is grouped by meal with a
+subtotal for each:
+
+```
+🍳 Breakfast — 255 kcal
+   • 3 large eggs — 215
+   • ...
+🥗 Lunch — 44 kcal
+   • Dijon vinaigrette, 33 servings — 29
+   • 59 g arugula — 15
+
+Today: 299 kcal
+```
 
 Claude reads each message and works out what you want. It sees today's log, so a fix or
 removal finds the right entry, and a fix keeps the entry's original time. The bot also
@@ -154,7 +172,8 @@ Anthropic API directly (`claude-opus-5-5`). That's faster but billed per token, 
   `claude -p` in a throwaway folder. The message goes in on stdin and a JSON schema comes back
   as structured output. Text runs get no tools, and photo runs may only read the photo. At
   most two estimates run at once, to spare the Pi's memory.
-- `calorie_bot/db.py`: SQLite. One row per food item, grouped by meal. "Today" is computed
+- `calorie_bot/db.py`: SQLite. One row per food item, tagged with its meal and grouped by
+  the message it came from. "Today" is computed
   in your `TIMEZONE`, so a midnight snack counts toward the right day.
 
 ## Tests
