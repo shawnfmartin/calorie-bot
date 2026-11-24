@@ -9,6 +9,7 @@ import re
 import logging
 import os
 import uuid
+from collections import deque
 from zoneinfo import ZoneInfo
 
 from telegram import Update
@@ -49,6 +50,11 @@ def fmt_kcal(n: float) -> str:
     return f"{int(round(n)):,}"
 
 
+def fmt_small_kcal(n: float) -> str:
+    """Like fmt_kcal, but keeps a decimal under 10 kcal (a serving of dressing can be 0.8)."""
+    return f"{n:.1f}" if 0 < n < 10 else fmt_kcal(n)
+
+
 def day_summary(store: Store, user_id: int) -> str:
     total = sum(e.calories for e in store.entries_for_day(user_id, store.today()))
     goal = store.get_goal(user_id)
@@ -72,6 +78,48 @@ async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await update.effective_message.reply_text(HELP, parse_mode=ParseMode.HTML)
 
 
+class ChatMemory:
+    """The last few messages each way, per user, so "rename it" knows what "it" is.
+
+    Kept in memory only: a restart forgets it, which is fine for short-range context."""
+
+    def __init__(self, max_lines: int = 8, max_chars: int = 400):
+        self.max_lines, self.max_chars = max_lines, max_chars
+        self._lines: dict[int, deque] = {}
+
+    def add(self, user_id: int, who: str, text: str) -> None:
+        plain = html.unescape(re.sub(r"<[^>]+>", "", text)).strip()
+        if len(plain) > self.max_chars:
+            plain = plain[: self.max_chars] + "…"
+        self._lines.setdefault(user_id, deque(maxlen=self.max_lines)).append(f"{who}: {plain}")
+
+    def lines(self, user_id: int) -> list[str]:
+        return list(self._lines.get(user_id, ()))
+
+
+class RecordingMessage:
+    """Wraps a Telegram message so every reply_text is also remembered."""
+
+    def __init__(self, msg, memory: ChatMemory, user_id: int):
+        self._msg, self._memory, self._user_id = msg, memory, user_id
+
+    async def reply_text(self, text, **kwargs):
+        self._memory.add(self._user_id, "Bot", text)
+        return await self._msg.reply_text(text, **kwargs)
+
+    def __getattr__(self, name):
+        return getattr(self._msg, name)
+
+
+def remembering(update: Update, ctx: ContextTypes.DEFAULT_TYPE, user_text: str):
+    """Record the user's message; return (context before it, message that records replies)."""
+    memory: ChatMemory = ctx.bot_data.setdefault("memory", ChatMemory())
+    user_id = update.effective_user.id
+    history = memory.lines(user_id)
+    memory.add(user_id, "User", user_text)
+    return history, RecordingMessage(update.effective_message, memory, user_id)
+
+
 async def keep_typing(ctx: ContextTypes.DEFAULT_TYPE, chat_id: int) -> None:
     """Show "typing..." until cancelled (Telegram clears it after ~5s, estimates take longer)."""
     with contextlib.suppress(Exception):
@@ -83,11 +131,12 @@ async def keep_typing(ctx: ContextTypes.DEFAULT_TYPE, chat_id: int) -> None:
 async def log_meal(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     store: Store = ctx.bot_data["store"]
     estimator = ctx.bot_data["estimator"]
-    msg = update.effective_message
     user_id = update.effective_user.id
+    raw = update.effective_message
+    text = raw.text or raw.caption
+    history, msg = remembering(update, ctx, (text or "") + (" [photo]" if raw.photo else ""))
 
     image = None
-    text = msg.text or msg.caption
     if msg.photo:
         tg_file = await msg.photo[-1].get_file()
         image = bytes(await tg_file.download_as_bytearray())
@@ -96,7 +145,8 @@ async def log_meal(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     try:
         recipes = store.list_recipes(user_id)
         result = await estimator.estimate(text=text, image=image,
-                                          recipe_names=[recipe_label(r) for r in recipes])
+                                          recipe_names=[recipe_label(r) for r in recipes],
+                                          history=history)
     except EstimateError as e:
         await msg.reply_text(f"⚠️ {e}")
         return
@@ -110,8 +160,14 @@ async def log_meal(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         await save_recipe_and_reply(msg, store, user_id, {**recipe_out, "note": note},
                                     source_text=text or "photo")
         return
-    if result.get("intent") == "update_recipe":
+    intent = result.get("intent")
+    if intent == "update_recipe":
         await update_recipe_and_reply(msg, store, user_id, recipe_out)
+        return
+    if intent in ("rename_recipe", "show_recipe", "list_recipes", "delete_recipe"):
+        await recipe_request_reply(msg, store, user_id, intent,
+                                   (recipe_out.get("name") or "").strip(),
+                                   (result.get("rename_to") or "").strip())
         return
     if not items:
         await msg.reply_text(note or "I couldn't find any food in that. Try e.g. "
@@ -181,7 +237,7 @@ def recipe_card(r: Recipe) -> str:
                      f"({r.calories / w:.2f} kcal/g) · P {r.protein_g / w * 100:.1f}g · "
                      f"C {r.carbs_g / w * 100:.1f}g · F {r.fat_g / w * 100:.1f}g")
     if r.servings:
-        lines.append(f"<b>Per serving</b> (makes {r.servings:g}): {fmt_kcal(r.calories / r.servings)} kcal")
+        lines.append(f"<b>Per serving</b> (makes {r.servings:g}): {fmt_small_kcal(r.calories / r.servings)} kcal")
     return "\n".join(lines)
 
 
@@ -195,6 +251,18 @@ def split_recipe_message(text: str) -> tuple[str, str]:
     if AMOUNT_RE.search(name):
         name, body = "", f"{name}\n{body}".strip()
     return name, body
+
+
+SERVINGS_RE = re.compile(
+    r"\b(?:serves|yields?|makes)\s+(\d+(?:\.\d+)?)(?![\d.])"
+    r"(?!\s*(?:g|kg|grams?|ml|l|liters?|oz|lbs?|pounds?|cups?|quarts?)\b)"
+    r"|\b(\d+(?:\.\d+)?)\s*(?:servings?|portions?)\b", re.I)
+
+
+def servings_in(text: str) -> float:
+    """'Totaling 107 servings', 'serves 4', 'makes 6 portions' -> the number; 0 if none."""
+    m = SERVINGS_RE.search(text or "")
+    return float(m.group(1) or m.group(2)) if m else 0
 
 
 AMOUNT_RE = re.compile(r"\d\s*(g|kg|mg|ml|l|oz|lbs?|cups?|tbsp|tsp|grams?)\b", re.I)
@@ -225,9 +293,9 @@ async def save_recipe_and_reply(msg, store: Store, user_id: int, result: dict,
         name, made_up = free_name(store, user_id, suggested or "Untitled recipe"), True
 
     before = store.get_recipe(user_id, name)
+    servings = result.get("servings") or servings_in(source_text)  # backup if Claude missed it
     recipe, replaced = store.save_recipe(user_id, name, ingredients,
-                                         result.get("final_weight_g") or 0,
-                                         result.get("servings") or 0, source_text)
+                                         result.get("final_weight_g") or 0, servings, source_text)
     if replaced and before:
         head = (f"✅ Updated your recipe (it was {fmt_kcal(before.calories)} kcal for "
                 f"{before.total_weight_g:g} g)")
@@ -247,8 +315,8 @@ async def save_recipe_and_reply(msg, store: Store, user_id: int, result: dict,
 async def cmd_recipe(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     store: Store = ctx.bot_data["store"]
     estimator = ctx.bot_data["estimator"]
-    msg = update.effective_message
     user_id = update.effective_user.id
+    _, msg = remembering(update, ctx, update.effective_message.text or "")
     name, body = split_recipe_message(msg.text or "")
 
     if not name and not body:
@@ -280,17 +348,9 @@ async def cmd_recipe(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def cmd_recipes(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     store: Store = ctx.bot_data["store"]
-    recipes = store.list_recipes(update.effective_user.id)
-    if not recipes:
-        await update.effective_message.reply_text(
-            "No saved recipes yet. Save one with /recipe <name> and the ingredients on the next lines.")
-        return
-    lines = ["📖 <b>Your recipes</b>"]
-    for r in recipes:
-        serving = f", {fmt_kcal(r.calories / r.servings)} per serving" if r.servings else ""
-        lines.append(f"• {html.escape(r.name)} — {fmt_kcal(per_100g(r))} kcal/100 g{serving}")
-    lines.append("\n/recipe &lt;name&gt; shows the ingredients.")
-    await update.effective_message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
+    _, msg = remembering(update, ctx, update.effective_message.text or "/recipes")
+    await msg.reply_text(recipes_list_text(store, update.effective_user.id),
+                         parse_mode=ParseMode.HTML)
 
 
 async def update_recipe_and_reply(msg, store: Store, user_id: int, recipe_out: dict) -> None:
@@ -314,6 +374,45 @@ async def update_recipe_and_reply(msg, store: Store, user_id: int, recipe_out: d
         changed.append(f"weighs {weight:g} g when finished")
     await msg.reply_text(f"✅ Got it: “{html.escape(recipe.name)}” {' and '.join(changed)}.\n\n"
                          + recipe_card(recipe), parse_mode=ParseMode.HTML)
+
+
+def recipes_list_text(store: Store, user_id: int) -> str:
+    recipes = store.list_recipes(user_id)
+    if not recipes:
+        return ("No saved recipes yet. Send the ingredients and say “save this recipe”, "
+                "or use /recipe.")
+    lines = ["📖 <b>Your recipes</b>"]
+    for r in recipes:
+        serving = f", {fmt_small_kcal(r.calories / r.servings)} per serving" if r.servings else ""
+        lines.append(f"• {html.escape(r.name)} — {fmt_kcal(per_100g(r))} kcal/100 g{serving}")
+    lines.append("\nAsk to see one, e.g. “show the vinaigrette”.")
+    return "\n".join(lines)
+
+
+async def recipe_request_reply(msg, store: Store, user_id: int, intent: str,
+                               name: str, new_name: str) -> None:
+    if intent == "list_recipes":
+        await msg.reply_text(recipes_list_text(store, user_id), parse_mode=ParseMode.HTML)
+        return
+    recipe = store.get_recipe(user_id, name) if name else None
+    if recipe is None:
+        names = ", ".join(r.name for r in store.list_recipes(user_id)) or "none yet"
+        await msg.reply_text(f"I couldn't tell which recipe you meant. Your recipes: {names}.")
+        return
+    if intent == "show_recipe":
+        await msg.reply_text(recipe_card(recipe), parse_mode=ParseMode.HTML)
+    elif intent == "delete_recipe":
+        # Deleting is permanent, so a plain message only offers it; the command does it.
+        await msg.reply_text(f"To delete “{recipe.name}”, send:\n/deleterecipe {recipe.name}")
+    elif intent == "rename_recipe":
+        if not new_name:
+            await msg.reply_text(f"What should I rename “{recipe.name}” to?")
+            return
+        result = store.rename_recipe(user_id, recipe.name, new_name)
+        replies = {"ok": f"✅ Renamed “{recipe.name}” to “{new_name}”.",
+                   "taken": f"You already have a recipe called “{new_name}”. "
+                            "Delete or rename that one first."}
+        await msg.reply_text(replies.get(result, f"No saved recipe called “{recipe.name}”."))
 
 
 async def cmd_renamerecipe(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:

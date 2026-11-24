@@ -28,8 +28,9 @@ RECIPE_RULES = """Estimate the calories and macros of each ingredient at the sta
 convert each amount to grams (use typical weights for units like "1 cup", "2 cloves", "a pinch").
 Water, salt and other zero-calorie ingredients still count toward the weight.
 If the user states the finished weight (e.g. after cooking, "makes 1.2 kg"), put it in
-`final_weight_g`; otherwise 0. If they state how many servings it makes, put that in `servings`;
-otherwise 0.
+`final_weight_g`; otherwise 0. If they say how many servings or portions it makes, in any wording
+("makes 4", "serves 4", "4 servings", "totaling 107 servings", "yields 12"), put that number in
+`servings`; otherwise 0.
 
 For the recipe's `name`: if the user named it, use their name, and set `name_given` to true. If the
 name matches one of their saved recipes (loosely), use the saved recipe's exact name: they are
@@ -42,6 +43,10 @@ The user tells you (in text, a photo, or both) what they ate. Break it into indi
 and estimate calories and macros for each, using typical portion sizes when none is given
 (e.g. "a bowl of oatmeal" ~ 1 cup cooked). Use the user's quantities and brands when stated.
 Name each item with its portion, e.g. "2 large eggs, scrambled in butter".
+
+Recent messages between the user and the bot may be included for context. Use them to work out
+what "it", "that" or "the recipe" refers to (usually the recipe just saved or shown), but only
+act on the user's latest message.
 
 The user may have saved recipes; they are listed with the message as
 "Name (whole batch: N g, M servings)". When an item is one
@@ -68,9 +73,18 @@ Set `intent` to one of:
   weighed 1.6 kg after cooking"). Leave `items` empty; set `recipe.name` to the saved recipe's
   exact name, `recipe.servings` and/or `recipe.final_weight_g` to the new values (0 for anything
   not mentioned), and no ingredients.
+- "rename_recipe": the user wants to rename a saved recipe ("rename it to Dijon vinaigrette",
+  "call the chili Turkey chili"). Set `recipe.name` to the saved recipe's exact current name
+  (use the recent messages to resolve "it") and `rename_to` to the new name, written as they
+  wrote it but with obvious spelling mistakes fixed.
+- "show_recipe": the user wants to see a saved recipe. Set `recipe.name` to its exact name.
+- "list_recipes": the user wants to see all their saved recipes.
+- "delete_recipe": the user wants to delete a saved recipe. Set `recipe.name` to its exact name.
 - "other": anything else (a greeting, a question, something unrelated). Leave `items` empty and
   put a short helpful reply in `note`.
-When `intent` is "log_meal" or "other", set `recipe` to an empty name, no ingredients and zeros.
+For every intent except "save_recipe", leave `recipe.ingredients` empty; set `recipe.name` only
+where described above, and the rest of `recipe` to empty or zero. Set `rename_to` to "" except
+for "rename_recipe".
 
 Recipe rules:
 """ + RECIPE_RULES + """
@@ -130,12 +144,15 @@ MEAL_SCHEMA = {
                 "additionalProperties": False,
             },
         },
-        "intent": {"type": "string", "enum": ["log_meal", "save_recipe", "update_recipe", "other"]},
+        "intent": {"type": "string", "enum": ["log_meal", "save_recipe", "update_recipe", "rename_recipe",
+                                             "show_recipe", "list_recipes", "delete_recipe",
+                                             "other"]},
+        "rename_to": {"type": "string"},
         "recipe": {"type": "object", "properties": _RECIPE_PROPS, "required": _RECIPE_KEYS,
                    "additionalProperties": False},
         "note": {"type": "string"},
     },
-    "required": ["intent", "items", "recipe", "note"],
+    "required": ["intent", "items", "recipe", "rename_to", "note"],
     "additionalProperties": False,
 }
 
@@ -153,8 +170,13 @@ class EstimateError(Exception):
     """Raised with a user-facing message when an estimate can't be produced."""
 
 
-def meal_prompt(text: str | None, recipe_names: list[str] | None) -> str:
-    prompt = text or "Here's a photo of what I ate."
+def meal_prompt(text: str | None, recipe_names: list[str] | None,
+                history: list[str] | None = None) -> str:
+    prompt = ""
+    if history:
+        prompt += "Recent messages, oldest first (context only):\n" + "\n".join(history) + "\n\n"
+        prompt += "My latest message:\n"
+    prompt += text or "Here's a photo of what I ate."
     if recipe_names:
         prompt += "\n\nMy saved recipes: " + "; ".join(recipe_names)
     return prompt
@@ -165,9 +187,10 @@ class _Estimator:
 
     async def estimate(self, text: str | None = None, image: bytes | None = None,
                        image_type: str = "image/jpeg",
-                       recipe_names: list[str] | None = None) -> dict:
+                       recipe_names: list[str] | None = None,
+                       history: list[str] | None = None) -> dict:
         return await self._structured(MEAL_PROMPT, MEAL_SCHEMA,
-                                      meal_prompt(text, recipe_names), image, image_type)
+                                      meal_prompt(text, recipe_names, history), image, image_type)
 
     async def estimate_recipe(self, text: str, name: str = "",
                               recipe_names: list[str] | None = None) -> dict:

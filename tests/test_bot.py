@@ -372,3 +372,66 @@ def test_recipe_label(tmp_path):
     assert recipe_label(r) == "Vinaigrette (whole batch: 120 g, servings not set)"
     r = s.update_recipe_size(1, "Vinaigrette", servings=4)
     assert recipe_label(r) == "Vinaigrette (whole batch: 120 g, 4 servings)"
+
+
+# ---- context, plain-language recipe requests, servings backup ------------------------
+
+from calorie_bot.bot import ChatMemory, RecordingMessage, recipe_request_reply, servings_in  # noqa: E402
+from calorie_bot.nutrition import meal_prompt  # noqa: E402
+
+
+@pytest.mark.parametrize("text,expected", [
+    ("Salt 1 g\n\nTotaling 107 servings", 107), ("serves 4", 4), ("Makes 6 portions", 6),
+    ("makes 12", 12), ("yields 2.5 servings", 2.5), ("makes 1.2 kg", 0), ("makes 2 cups", 0),
+    ("Dijon mustard 20 g", 0),
+])
+def test_servings_in(text, expected):
+    assert servings_in(text) == expected
+
+
+def test_servings_backup_when_claude_misses_it(tmp_path):
+    s = Store(tmp_path / "t.db", TZ)
+    asyncio.run(save_recipe_and_reply(FakeMsg(), s, 1, recipe_result("Vinaigrette", True),
+                                      "Dijon mustard 20 g\n...\nTotaling 107 servings"))
+    r = s.get_recipe(1, "vinaigrette")
+    assert r.servings == 107
+    assert round(r.portion(servings=33)["calories"], 1) == round(92 * 33 / 107, 1)
+
+
+def test_chat_memory_and_recording_message():
+    mem = ChatMemory(max_lines=3, max_chars=20)
+    msg = RecordingMessage(FakeMsg(), mem, 1)
+    mem.add(1, "User", "save my vinaigrette")
+    asyncio.run(msg.reply_text("✅ Saved <b>Vinaigrette</b> &amp; more text that is long"))
+    mem.add(1, "User", "rename it")
+    mem.add(1, "User", "4th line")
+    assert mem.lines(1) == ["Bot: ✅ Saved Vinaigrette …", "User: rename it", "User: 4th line"]
+    assert mem.lines(2) == []
+    assert msg.replies  # forwarded to the real message (via __getattr__)
+
+
+def test_meal_prompt_includes_history():
+    p = meal_prompt("Rename to Dijon vinegrette", ["Vinaigrette (whole batch: 104 g, 107 servings)"],
+                    ["User: Make vinaigrette recipe for ...", "Bot: ✅ Saved recipe Vinaigrette"])
+    assert p.startswith("Recent messages, oldest first")
+    assert "My latest message:\nRename to Dijon vinegrette" in p
+    assert p.endswith("My saved recipes: Vinaigrette (whole batch: 104 g, 107 servings)")
+
+
+def test_plain_language_rename_show_list_delete(tmp_path):
+    s = Store(tmp_path / "t.db", TZ)
+    s.save_recipe(1, "Vinaigrette", VINAIGRETTE, 0, 107, "src")
+    msg = FakeMsg()
+    run = lambda *a: asyncio.run(recipe_request_reply(msg, s, 1, *a))
+    run("rename_recipe", "Vinaigrette", "Dijon vinaigrette")
+    assert msg.replies[-1] == "✅ Renamed “Vinaigrette” to “Dijon vinaigrette”."
+    assert s.get_recipe(1, "dijon vinaigrette") is not None
+    run("show_recipe", "Dijon vinaigrette", "")
+    assert "📖 <b>Dijon vinaigrette</b>" in msg.replies[-1]
+    run("list_recipes", "", "")
+    assert "Dijon vinaigrette" in msg.replies[-1]
+    run("delete_recipe", "Dijon vinaigrette", "")
+    assert "/deleterecipe Dijon vinaigrette" in msg.replies[-1]
+    assert s.get_recipe(1, "dijon vinaigrette") is not None          # not deleted from plain text
+    run("rename_recipe", "Soup", "Stew")
+    assert "couldn't tell which recipe" in msg.replies[-1]

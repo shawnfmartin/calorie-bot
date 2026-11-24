@@ -60,6 +60,12 @@ A made-up name never overwrites a recipe you already have. It gets a number inst
 "… 2". If you do give the name of a saved recipe, the bot updates that recipe and tells you
 what the old numbers were.
 
+Managing recipes works the same way in plain words: *"rename it to Dijon vinaigrette"*,
+*"show the vinaigrette"*, *"what recipes do I have"*. The bot remembers your last few
+messages, so "it" means the recipe you were just working with. That memory resets when the
+bot restarts. Deleting is the exception: a plain *"delete the vinaigrette"* only replies with
+the `/deleterecipe` command to send, so a misunderstood message can't delete a recipe.
+
 Claude estimates each ingredient once, and the bot saves the totals: 90 kcal for 120 g,
 or 0.75 kcal/g. Later, a message like *"37g of the dijon vinaigrette on my salad for
 lunch"* logs the vinaigrette at exactly 37 × 0.75 = 28 kcal, worked out from the saved
@@ -75,7 +81,7 @@ You can log a portion of a recipe three ways:
 | *"1 serving of chili"* | servings ÷ the servings the recipe makes |
 | *"half the batch of chili"*, *"a quarter of the vinaigrette"* | that share of the whole batch |
 
-- **Servings:** put `makes 6 servings` in the recipe when you save it, or add it later in a
+- **Servings:** put `makes 6 servings` (or "serves 6", "totaling 107 servings") in the recipe when you save it, or add it later in a
   plain message: *"the vinaigrette makes 4 servings"*. If you log "1 serving" before any
   servings are set, Claude estimates a typical serving in grams of your recipe and says so
   in the reply.
