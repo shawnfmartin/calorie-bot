@@ -626,3 +626,87 @@ def test_logging_uses_meal_and_corrections_keep_it(tmp_path):
         "show_day", meal="dinner"))
     assert "Nothing logged for lunch today" in chat.say("and lunch?", claude_says(
         "show_day", meal="lunch"))
+
+
+# ---- cooked recipes ---------------------------------------------------------------
+
+def ing(name, grams, cooked_grams, kcal, protein=0, fat=0):
+    return {"ingredient": name, "grams": grams, "cooked_grams": cooked_grams, "calories": kcal,
+            "protein_g": protein, "carbs_g": 0, "fat_g": fat}
+
+
+DIJON_CHICKEN = [  # 706 g raw, 876 kcal; chicken keeps ~75% of its weight
+    ing("Chicken breast, raw", 644, 483, 773, 145, 17),
+    ing("Dijon mustard", 18, 18, 12), ing("Soy sauce", 12, 12, 6), ing("Ginger-garlic paste", 15, 15, 12),
+    ing("Olive oil", 5, 5, 44, 0, 5), ing("Spices", 10, 10, 29), ing("Salt", 2, 2, 0),
+]
+
+
+def test_cooked_recipe_uses_estimated_cooked_weight(tmp_path):
+    s = Store(tmp_path / "t.db", TZ)
+    r, _ = s.save_recipe(1, "Dijon chicken", DIJON_CHICKEN, 0, 0, "src", cooked=True)
+    assert (r.raw_weight_g, r.total_weight_g, r.weight_basis) == (706, 545, "estimated") and r.cooked
+    p = r.portion(grams=100)
+    assert round(p["calories"]) == round(876 * 100 / 545) == 161      # not 124 (raw-based)
+    assert p["item"] == "Dijon chicken, 100 g cooked"
+    raw = r.portion(grams=100, raw=True)
+    assert round(raw["calories"]) == 124 and raw["item"] == "Dijon chicken, 100 g raw"
+    assert r.portion(fraction=0.5)["calories"] == 438                  # fractions don't care
+
+
+def test_weighing_replaces_the_estimate(tmp_path):
+    s = Store(tmp_path / "t.db", TZ)
+    s.save_recipe(1, "Dijon chicken", DIJON_CHICKEN, 0, 0, "src", cooked=True)
+    r = s.update_recipe_size(1, "Dijon chicken", final_weight_g=520)
+    assert (r.total_weight_g, r.weight_basis, r.raw_weight_g) == (520, "weighed", 706)
+    assert round(r.portion(grams=100)["calories"]) == 168
+    r2, _ = s.save_recipe(1, "Stew", DIJON_CHICKEN, 600, 0, "weighed 600 g", cooked=True)
+    assert (r2.total_weight_g, r2.weight_basis) == (600, "weighed")
+
+
+def test_uncooked_recipe_stays_raw(tmp_path):
+    s = Store(tmp_path / "t.db", TZ)
+    r, _ = s.save_recipe(1, "Vinaigrette", VINAIGRETTE, 0, 0, "src", cooked=False)
+    assert (r.total_weight_g, r.weight_basis, r.cooked) == (120, "raw", False)
+    assert r.portion(grams=37)["item"] == "Dijon vinaigrette, 37 g".replace("Dijon v", "V")
+    assert r.portion(grams=37, raw=True) == r.portion(grams=37)          # raw = finished here
+
+
+def test_cooked_recipe_label_and_card(tmp_path):
+    from calorie_bot.bot import recipe_label
+    s = Store(tmp_path / "t.db", TZ)
+    r, _ = s.save_recipe(1, "Dijon chicken", DIJON_CHICKEN, 0, 0, "src", cooked=True)
+    assert recipe_label(r) == "Dijon chicken (whole batch: 545 g cooked, 706 g raw, servings not set)"
+    card = recipe_card(r)
+    assert "706 g raw → about 545 g cooked (estimated)" in card
+    assert "Per 100 g cooked:</b> 161 kcal" in card
+    msg = FakeMsg()
+    asyncio.run(save_recipe_and_reply(msg, s, 1, {"name": "Dijon chicken", "name_given": True,
+        "ingredients": DIJON_CHICKEN, "cooked": True, "final_weight_g": 0, "servings": 0}, "src"))
+    assert "weigh it after cooking" in msg.replies[-1]
+
+
+def test_apply_recipes_raw_flag(tmp_path):
+    s = Store(tmp_path / "t.db", TZ)
+    s.save_recipe(1, "Dijon chicken", DIJON_CHICKEN, 0, 0, "src", cooked=True)
+    base = {**item("chicken", 999), "recipe": "Dijon chicken", "recipe_grams": 100,
+            "recipe_servings": 0, "recipe_fraction": 0}
+    out, used, _ = apply_recipes(s, 1, [{**base, "recipe_grams_raw": False},
+                                        {**base, "recipe_grams_raw": True}])
+    assert used == [True, True] and [round(o["calories"]) for o in out] == [161, 124]
+
+
+def test_old_recipes_get_raw_weight(tmp_path):
+    path = tmp_path / "old.db"
+    s = Store(path, TZ)
+    s.save_recipe(1, "Vinaigrette", VINAIGRETTE, 0, 0, "src")
+    s.save_recipe(1, "Chili", VINAIGRETTE, 60, 0, "weighed")
+    # Turn it back into the old schema: no raw_weight_g / weight_basis columns.
+    s.conn.executescript("""CREATE TABLE r2 AS SELECT id, user_id, name, name_key, ingredients,
+        total_weight_g, servings, calories, protein_g, carbs_g, fat_g, source_text, updated_at
+        FROM recipes; DROP TABLE recipes; ALTER TABLE r2 RENAME TO recipes;""")
+    s.conn.close()
+    s = Store(path, TZ)
+    v, c = s.get_recipe(1, "vinaigrette"), s.get_recipe(1, "chili")
+    assert (v.raw_weight_g, v.weight_basis) == (120, "raw")
+    assert (c.raw_weight_g, c.total_weight_g, c.weight_basis) == (120, 60, "weighed")

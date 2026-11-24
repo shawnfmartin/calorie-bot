@@ -103,10 +103,27 @@ You can log a portion of a recipe three ways:
   plain message: *"the vinaigrette makes 4 servings"*. If you log "1 serving" before any
   servings are set, Claude estimates a typical serving in grams of your recipe and says so
   in the reply.
-- **Cooked dishes:** if the finished weight differs from the raw ingredients (water cooks
-  off), include it: *"weighed 1.8 kg cooked"*. You can also add it later: *"the chili
-  weighed 1.6 kg after cooking"*. Portions in grams are then measured against that weight.
+- **Cooked dishes:** see below.
 - **Changing a recipe:** send it again under the same name with the new ingredients.
+
+### Raw ingredients, cooked portions
+
+You weigh ingredients raw, but you weigh your plate cooked, and cooking changes the weight
+without changing the calories. Chicken breast loses about a quarter of its weight as water,
+while rice soaks up water and roughly triples. So when you save a recipe that gets cooked,
+Claude also estimates each ingredient's cooked weight from typical cooking yields, and
+portions are measured against the cooked total:
+
+```
+Dijon chicken: 879 kcal, 706 g raw → about 545 g cooked (estimated)
+"100g dijon chicken for lunch"  →  879 × 100 / 545 = 161 kcal   (raw-based would say 124)
+```
+
+- **Weigh it for exact numbers:** *"the dijon chicken weighed 520 g after cooking"*
+  replaces the estimate with your weight. You can also give it when saving: *"…weighed
+  1.8 kg cooked"*.
+- **Raw portions:** *"100g raw dijon chicken"* is measured against the raw weight instead.
+- **Uncooked recipes** (dressings, salads, smoothies) just use the raw total.
 
 ## Setup
 

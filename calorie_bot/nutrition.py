@@ -26,9 +26,25 @@ API_MODEL = "claude-opus-5-5"
 
 RECIPE_RULES = """Estimate the calories and macros of each ingredient at the stated amount, and
 convert each amount to grams (use typical weights for units like "1 cup", "2 cloves", "a pinch").
-Water, salt and other zero-calorie ingredients still count toward the weight.
-If the user states the finished weight (e.g. after cooking, "makes 1.2 kg"), put it in
-`final_weight_g`; otherwise 0. If they say how many servings or portions it makes, in any wording
+Water, salt and other zero-calorie ingredients still count toward the weight. Amounts are what
+the user weighed before cooking (raw), unless they say an amount is cooked; estimate calories
+for exactly the amount given, in that state.
+
+Cooking: if the dish gets cooked (meat, fish, eggs, grains, pasta, roasted or sautéed vegetables,
+baked goods), set `cooked` to true and give each ingredient's `cooked_grams`: its weight in the
+finished dish, from typical cooking yields. For example: chicken breast about 75% of raw,
+chicken thigh 70%, ground beef 70%, pork 70%, salmon and white fish 80%, eggs 90%, dry rice
+about 300%, dry pasta 225%, dry oats (cooked in water) 250%, dry lentils/beans 250%, onions
+and peppers sautéed 60%, mushrooms 50%, spinach 15%, potatoes roasted 75%. Spices, salt,
+mustard, sauces, pastes and oil stay about the same (marinades and pan sauces can lose a
+little water). Water or stock added to the pot counts as an ingredient and mostly stays
+when absorbed (rice, oats), or partly boils off in sauces and stews. If the dish isn't
+cooked (dressings, salads, smoothies, overnight oats), set `cooked` to false and
+`cooked_grams` equal to `grams`. Calories don't change with cooking: keep them for the raw
+amounts.
+If the user states the weight of the finished dish (e.g. "weighed 520 g cooked", "makes
+1.2 kg"), put it in `final_weight_g`; otherwise 0. A weight they give for one raw ingredient
+("644g chicken") is that ingredient's amount, not the finished weight. If they say how many servings or portions it makes, in any wording
 ("makes 4", "serves 4", "4 servings", "totaling 107 servings", "yields 12"), put that number in
 `servings`; otherwise 0.
 
@@ -52,11 +68,15 @@ what "it", "that" or "the recipe" refers to (usually the recipe just saved or sh
 act on the user's latest message.
 
 The user may have saved recipes; they are listed with the message as
-"Name (whole batch: N g, M servings)". When an item is one
+"Name (whole batch: N g, M servings)"; for cooked dishes N is the cooked weight and the raw
+weight is listed too. When an item is one
 of those recipes (match loosely: "my vinaigrette", "the dijon dressing", typos), set `recipe` to
 the saved recipe's exact name (without the part in parentheses) and give the amount eaten in exactly one of these, leaving the
 other two at 0:
-- `recipe_grams` for a weight (convert spoons, cups or other units to grams as best you can),
+- `recipe_grams` for a weight (convert spoons, cups or other units to grams as best you can).
+  For a recipe listed as cooked, a weight means cooked weight, as served, unless they say it's
+  raw; then also set `recipe_grams_raw` to true. Otherwise `recipe_grams_raw` is false.
+  (The reply already says "cooked" or "raw", so don't repeat that in `note`.)
 - `recipe_servings` for servings ("1 serving", "2 bowls" when they mean servings), but only if
   that recipe's servings are set; if they are "not set", estimate the grams of one typical
   serving of that dish, at most the whole batch, use `recipe_grams` instead, and say so in `note`,
@@ -132,11 +152,12 @@ _RECIPE_PROPS = {
         "items": {
             "type": "object",
             "properties": {"ingredient": {"type": "string"}, "grams": {"type": "number"},
-                           **_MACROS},
-            "required": ["ingredient", "grams", *_MACRO_KEYS],
+                           "cooked_grams": {"type": "number"}, **_MACROS},
+            "required": ["ingredient", "grams", "cooked_grams", *_MACRO_KEYS],
             "additionalProperties": False,
         },
     },
+    "cooked": {"type": "boolean"},
     "final_weight_g": {"type": "number"},
     "servings": {"type": "number"},
 }
@@ -161,9 +182,10 @@ MEAL_SCHEMA = {
                     "recipe_grams": {"type": "number"},
                     "recipe_servings": {"type": "number"},
                     "recipe_fraction": {"type": "number"},
+                    "recipe_grams_raw": {"type": "boolean"},
                 },
                 "required": ["item", *_MACRO_KEYS, "recipe", "recipe_grams", "recipe_servings",
-                             "recipe_fraction"],
+                             "recipe_fraction", "recipe_grams_raw"],
                 "additionalProperties": False,
             },
         },

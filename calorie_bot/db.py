@@ -31,7 +31,9 @@ CREATE TABLE IF NOT EXISTS recipes (
     name           TEXT    NOT NULL,
     name_key       TEXT    NOT NULL,       -- lower-cased name, for lookups
     ingredients    TEXT    NOT NULL,       -- JSON list from the estimator
-    total_weight_g REAL    NOT NULL,       -- finished weight the totals are spread over
+    total_weight_g REAL    NOT NULL,       -- finished (cooked) weight portions are measured on
+    raw_weight_g   REAL    NOT NULL DEFAULT 0,  -- sum of the raw ingredient weights
+    weight_basis   TEXT    NOT NULL DEFAULT 'raw',  -- raw | estimated (cooked) | weighed
     servings       REAL    NOT NULL DEFAULT 0,
     calories       REAL    NOT NULL,       -- whole-recipe totals
     protein_g      REAL    NOT NULL,
@@ -102,9 +104,21 @@ class Recipe:
     protein_g: float
     carbs_g: float
     fat_g: float
+    raw_weight_g: float = 0
+    weight_basis: str = "raw"   # raw: not cooked; estimated: cooked weight guessed; weighed
 
-    def portion(self, grams: float = 0, servings: float = 0, fraction: float = 0) -> dict | None:
-        """Calories and macros for a portion, or None if the amount can't be worked out."""
+    @property
+    def cooked(self) -> bool:
+        return self.weight_basis in ("estimated", "weighed") and self.raw_weight_g > 0 \
+            and abs(self.raw_weight_g - self.total_weight_g) > 0.5
+
+    def portion(self, grams: float = 0, servings: float = 0, fraction: float = 0,
+                raw: bool = False) -> dict | None:
+        """Calories and macros for a portion, or None if the amount can't be worked out.
+
+        Grams are of the finished dish (cooked weight), unless `raw` says they're raw grams."""
+        if grams > 0 and raw and self.cooked:
+            return self._share(grams / self.raw_weight_g, f"{grams:g} g raw")
         if fraction > 0:
             share = fraction
             named = {0.25: "a quarter of the batch", 0.33: "a third of the batch",
@@ -117,6 +131,11 @@ class Recipe:
             label = f"{servings:g} serving" + ("" if servings == 1 else "s")
         else:
             return None
+        if grams > 0 and self.cooked and not fraction:
+            label += " cooked"
+        return self._share(share, label)
+
+    def _share(self, share: float, label: str) -> dict:
         out = {k: getattr(self, k) * share for k in MACROS}
         out["item"] = f"{self.name}, {label}"
         return out
@@ -136,6 +155,15 @@ class Store:
         columns = {r["name"] for r in self.conn.execute("PRAGMA table_info(entries)")}
         if "meal" not in columns:
             self.conn.execute("ALTER TABLE entries ADD COLUMN meal TEXT")
+        recipe_cols = {r["name"] for r in self.conn.execute("PRAGMA table_info(recipes)")}
+        if "raw_weight_g" not in recipe_cols:
+            self.conn.execute("ALTER TABLE recipes ADD COLUMN raw_weight_g REAL NOT NULL DEFAULT 0")
+            self.conn.execute("ALTER TABLE recipes ADD COLUMN weight_basis TEXT NOT NULL DEFAULT 'raw'")
+            for r in self.conn.execute("SELECT id, ingredients, total_weight_g FROM recipes").fetchall():
+                raw = sum(float(i.get("grams", 0)) for i in json.loads(r["ingredients"]))
+                basis = "weighed" if abs(raw - r["total_weight_g"]) > 0.5 else "raw"
+                self.conn.execute("UPDATE recipes SET raw_weight_g=?, weight_basis=? WHERE id=?",
+                                  (raw, basis, r["id"]))
         # Entries from before meals existed: what the user wrote, else the time of day.
         rows = self.conn.execute(
             "SELECT id, eaten_at, description FROM entries WHERE meal IS NULL").fetchall()
@@ -198,21 +226,34 @@ class Store:
         self.conn.commit()
 
     def save_recipe(self, user_id: int, name: str, ingredients: list[dict],
-                    final_weight_g: float, servings: float, source_text: str) -> tuple[Recipe, bool]:
-        """Create or replace a recipe. Returns (recipe, replaced_existing)."""
+                    final_weight_g: float, servings: float, source_text: str,
+                    cooked: bool = False) -> tuple[Recipe, bool]:
+        """Create or replace a recipe. Returns (recipe, replaced_existing).
+
+        Portions are measured against the finished weight: the weighed one if given, else for a
+        cooked dish the sum of the ingredients' estimated cooked weights, else the raw total."""
         totals = {k: sum(float(i.get(k, 0)) for i in ingredients) for k in MACROS}
-        weight = final_weight_g if final_weight_g > 0 else sum(float(i.get("grams", 0)) for i in ingredients)
+        raw = sum(float(i.get("grams", 0)) for i in ingredients)
+        cooked_est = sum(float(i.get("cooked_grams") or i.get("grams", 0)) for i in ingredients)
+        if final_weight_g > 0:
+            weight, basis = final_weight_g, "weighed"
+        elif cooked and cooked_est > 0 and abs(cooked_est - raw) > 0.5:
+            weight, basis = cooked_est, "estimated"
+        else:
+            weight, basis = raw, "raw"
         replaced = self.get_recipe(user_id, name) is not None
         self.conn.execute(
-            "INSERT INTO recipes (user_id, name, name_key, ingredients, total_weight_g, servings,"
-            " calories, protein_g, carbs_g, fat_g, source_text, updated_at)"
-            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?)"
+            "INSERT INTO recipes (user_id, name, name_key, ingredients, total_weight_g, raw_weight_g,"
+            " weight_basis, servings, calories, protein_g, carbs_g, fat_g, source_text, updated_at)"
+            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
             " ON CONFLICT(user_id, name_key) DO UPDATE SET name=excluded.name,"
             " ingredients=excluded.ingredients, total_weight_g=excluded.total_weight_g,"
+            " raw_weight_g=excluded.raw_weight_g, weight_basis=excluded.weight_basis,"
             " servings=excluded.servings, calories=excluded.calories,"
             " protein_g=excluded.protein_g, carbs_g=excluded.carbs_g, fat_g=excluded.fat_g,"
             " source_text=excluded.source_text, updated_at=excluded.updated_at",
-            (user_id, name.strip(), recipe_key(name), json.dumps(ingredients), weight, servings,
+            (user_id, name.strip(), recipe_key(name), json.dumps(ingredients), weight, raw, basis,
+             servings,
              totals["calories"], totals["protein_g"], totals["carbs_g"], totals["fat_g"],
              source_text, datetime.now(ZoneInfo("UTC")).isoformat(timespec="seconds")))
         self.conn.commit()
@@ -227,8 +268,8 @@ class Store:
         if servings > 0:
             self.conn.execute("UPDATE recipes SET servings=? WHERE id=?", (servings, recipe.id))
         if final_weight_g > 0:
-            self.conn.execute("UPDATE recipes SET total_weight_g=? WHERE id=?",
-                              (final_weight_g, recipe.id))
+            self.conn.execute("UPDATE recipes SET total_weight_g=?, weight_basis='weighed'"
+                              " WHERE id=?", (final_weight_g, recipe.id))
         self.conn.commit()
         return self.get_recipe(user_id, name)
 
@@ -266,7 +307,8 @@ class Store:
     @staticmethod
     def _recipe(r: sqlite3.Row) -> Recipe:
         return Recipe(r["id"], r["name"], json.loads(r["ingredients"]), r["total_weight_g"],
-                      r["servings"], r["calories"], r["protein_g"], r["carbs_g"], r["fat_g"])
+                      r["servings"], r["calories"], r["protein_g"], r["carbs_g"], r["fat_g"],
+                      r["raw_weight_g"], r["weight_basis"])
 
     def get_goal(self, user_id: int) -> int | None:
         row = self.conn.execute("SELECT daily_goal FROM settings WHERE user_id=?",

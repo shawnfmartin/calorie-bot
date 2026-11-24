@@ -328,7 +328,8 @@ def apply_recipes(store: Store, user_id: int,
         portion = None
         if recipe:
             grams, servings = i.get("recipe_grams") or 0, i.get("recipe_servings") or 0
-            portion = recipe.portion(grams, servings, i.get("recipe_fraction") or 0)
+            portion = recipe.portion(grams, servings, i.get("recipe_fraction") or 0,
+                                     raw=bool(i.get("recipe_grams_raw")))
             if portion is None and servings and not recipe.servings:
                 warnings.append(f"“{recipe.name}” doesn't have a number of servings yet, so I "
                                 f"estimated that one. Tell me e.g. “{recipe.name} makes 4 servings” "
@@ -443,7 +444,18 @@ async def goal_reply(msg, store: Store, user_id: int, goal: float) -> None:
 def recipe_label(r: Recipe) -> str:
     """How a saved recipe is described to Claude when it reads a message."""
     servings = f"{r.servings:g} servings" if r.servings else "servings not set"
+    if r.cooked:
+        return (f"{r.name} (whole batch: {r.total_weight_g:.0f} g cooked, "
+                f"{r.raw_weight_g:.0f} g raw, {servings})")
     return f"{r.name} (whole batch: {r.total_weight_g:g} g, {servings})"
+
+
+def batch_weight_text(r: Recipe) -> str:
+    if r.weight_basis == "estimated" and r.cooked:
+        return f"{r.raw_weight_g:.0f} g raw → about {r.total_weight_g:.0f} g cooked (estimated)"
+    if r.weight_basis == "weighed" and r.cooked:
+        return f"{r.raw_weight_g:.0f} g raw → {r.total_weight_g:.0f} g cooked (weighed)"
+    return f"{r.total_weight_g:g} g"
 
 
 def per_100g(r: Recipe) -> float:
@@ -455,10 +467,11 @@ def recipe_card(r: Recipe) -> str:
     for i in r.ingredients:
         lines.append(f"• {html.escape(i['ingredient'])} ({i['grams']:g} g) — {fmt_kcal(i['calories'])} kcal")
     lines.append("")
-    lines.append(f"<b>Whole recipe:</b> {fmt_kcal(r.calories)} kcal, {r.total_weight_g:g} g")
+    lines.append(f"<b>Whole recipe:</b> {fmt_kcal(r.calories)} kcal, {batch_weight_text(r)}")
     if r.total_weight_g:
         w = r.total_weight_g
-        lines.append(f"<b>Per 100 g:</b> {fmt_kcal(per_100g(r))} kcal "
+        state = " cooked" if r.cooked else ""
+        lines.append(f"<b>Per 100 g{state}:</b> {fmt_kcal(per_100g(r))} kcal "
                      f"({r.calories / w:.2f} kcal/g) · P {r.protein_g / w * 100:.1f}g · "
                      f"C {r.carbs_g / w * 100:.1f}g · F {r.fat_g / w * 100:.1f}g")
     if r.servings:
@@ -505,7 +518,8 @@ async def save_recipe_and_reply(msg, store: Store, user_id: int, result: dict,
     before = store.get_recipe(user_id, name)
     servings = result.get("servings") or servings_in(source_text)  # backup if Claude missed it
     recipe, replaced = store.save_recipe(user_id, name, ingredients,
-                                         result.get("final_weight_g") or 0, servings, source_text)
+                                         result.get("final_weight_g") or 0, servings, source_text,
+                                         cooked=bool(result.get("cooked")))
     if replaced and before:
         head = (f"✅ Updated your recipe (it was {fmt_kcal(before.calories)} kcal for "
                 f"{before.total_weight_g:g} g)")
@@ -517,8 +531,14 @@ async def save_recipe_and_reply(msg, store: Store, user_id: int, result: dict,
     if made_up:
         lines.append(f"\nYou didn't give it a name, so I called it “{html.escape(recipe.name)}”. "
                      "To change it, say e.g. “rename it to …”.")
+    if recipe.weight_basis == "estimated":
+        lines.append(f"\nThe cooked weight is an estimate. For exact numbers, weigh it after "
+                     f"cooking and tell me, e.g. “the {html.escape(recipe.name.lower())} weighed "
+                     f"{recipe.total_weight_g:.0f} g cooked”.")
     example = max(5, round(recipe.total_weight_g / 4 / 5) * 5)  # about a quarter of the batch
-    lines.append(f"\nLog a portion like: <i>{example:g}g of {html.escape(recipe.name.lower())}</i>")
+    cooked = " cooked" if recipe.cooked else ""
+    lines.append(f"\nLog a portion like: <i>{example:g}g of {html.escape(recipe.name.lower())}</i>"
+                 f" (grams{cooked}, as you'd weigh it on your plate)")
     await msg.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
 
 
