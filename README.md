@@ -21,50 +21,50 @@ Bot:  🍽 Logged
       Today: 1,420 / 2,000 kcal (580 left)
 ```
 
-## Commands
+## Talking to it
 
-| Command | What it does |
+There are no commands. Everything is a plain message:
+
+| To… | Say something like |
 |---|---|
-| *(any text or photo)* | Log a meal |
-| `/today` | Today's items with times, ids, total and macros |
-| `/week` | Last 7 days as a bar chart, plus your average |
-| `/undo` | Remove the last meal you logged |
-| `/delete <id>` | Remove one item (ids are shown in `/today`) |
-| `/goal 2000` / `/goal off` | Set or clear your daily goal |
-| `/recipe <name>` + ingredients on the next lines | Save (or update) a recipe |
-| `/recipe <name>` | Show a saved recipe: ingredients, total, per 100 g |
-| `/recipes` | List your saved recipes |
-| `/renamerecipe <old> = <new>` | Rename a recipe |
-| `/deleterecipe <name>` | Delete a recipe |
+| Log food | *"2 eggs and toast for breakfast"*, or send a photo |
+| See today | *"what did I eat today?"*, *"how many calories left?"* |
+| See the week | *"how did I do this week?"* |
+| Fix an entry | *"actually it was 2 eggs, not 3"*, *"the rice was 150g"* |
+| Remove an entry | *"remove the toast"*, *"undo"* |
+| Set a goal | *"set my goal to 2000"*, *"what's my goal?"*, *"no more goal"* |
+| Save a recipe | *"save this as my vinaigrette:"* and the ingredients |
+| Manage recipes | *"show my recipes"*, *"show the vinaigrette"*, *"rename it to …"*, *"delete the chili recipe"* |
+| Get help | *"help"* |
+
+Claude reads each message and works out what you want. It sees today's log, so a fix or
+removal finds the right entry, and a fix keeps the entry's original time. The bot also
+remembers your last few messages, so "it" means whatever you were just talking about. That
+memory resets when the bot restarts. A few short phrases ("today", "undo", "help", "my
+recipes") are answered instantly, without asking Claude. A message starting with `/` out of
+habit ("/today") works the same as without it.
+
+Deleting a recipe is the one thing that asks first: the bot replies *"Delete the recipe …?
+Reply yes to delete it or no to keep it."*
 
 ## Recipes
 
-Save something you make often once, then log portions of it by weight or by serving:
+Save something you make often once, then log portions of it by weight, by serving, or as a
+share of the batch:
 
 ```
-/recipe Dijon vinaigrette
+Save this as Dijon vinaigrette, makes 8 servings:
 Dijon mustard            20 g
 Apple cider vinegar      30 g
 Water                    55 g
 Extra virgin olive oil    5 g
 Honey                     7 g
-Garlic powder             1 g
-Salt                      1 g
-Black pepper              1 g
 ```
 
-You don't need the command. A plain message works too: *"Make a vinaigrette recipe for:"*
-followed by the ingredients, or *"save this as my chili"*. If you don't give a name, the
-bot makes up a short one, like "Honey dijon vinaigrette", and tells you how to rename it.
-A made-up name never overwrites a recipe you already have. It gets a number instead, like
-"… 2". If you do give the name of a saved recipe, the bot updates that recipe and tells you
-what the old numbers were.
-
-Managing recipes works the same way in plain words: *"rename it to Dijon vinaigrette"*,
-*"show the vinaigrette"*, *"what recipes do I have"*. The bot remembers your last few
-messages, so "it" means the recipe you were just working with. That memory resets when the
-bot restarts. Deleting is the exception: a plain *"delete the vinaigrette"* only replies with
-the `/deleterecipe` command to send, so a misunderstood message can't delete a recipe.
+If you don't give a name, the bot makes up a short one, like "Honey dijon vinaigrette".
+A made-up name never overwrites a recipe you already have; it gets a number instead, like
+"… 2". If you give the name of a saved recipe, the bot updates that recipe and tells you
+what the old numbers were. Meals you already logged keep their old numbers.
 
 Claude estimates each ingredient once, and the bot saves the totals: 90 kcal for 120 g,
 or 0.75 kcal/g. Later, a message like *"37g of the dijon vinaigrette on my salad for
@@ -88,8 +88,7 @@ You can log a portion of a recipe three ways:
 - **Cooked dishes:** if the finished weight differs from the raw ingredients (water cooks
   off), include it: *"weighed 1.8 kg cooked"*. You can also add it later: *"the chili
   weighed 1.6 kg after cooking"*. Portions in grams are then measured against that weight.
-- **Changing a recipe:** send `/recipe <same name>` with the new ingredients to replace it.
-  Meals you already logged keep their old numbers.
+- **Changing a recipe:** send it again under the same name with the new ingredients.
 
 ## Setup
 
@@ -99,19 +98,8 @@ installed. What's left:
 ### 1. Create the bot in Telegram
 1. Message **@BotFather** in Telegram and send `/newbot`. Pick a name and username.
 2. Copy the token it gives you.
-3. Optional: send BotFather `/setcommands` and paste this, so the commands show up in the menu:
-   ```
-   today - What I've eaten today
-   week - Last 7 days
-   undo - Remove the last meal
-   delete - Remove one item by id
-   goal - Set daily calorie goal
-   recipe - Save or show a recipe
-   recipes - List saved recipes
-   renamerecipe - Rename a recipe (old = new)
-   deleterecipe - Delete a recipe
-   help - How to use the bot
-   ```
+3. The bot has no commands, so leave its command menu empty. If you set one earlier, send
+   BotFather `/setcommands`, pick the bot, and reply `/empty` to clear it.
 
 ### 2. Add the token on the Pi
 ```bash
@@ -159,9 +147,11 @@ Anthropic API directly (`claude-opus-5-5`). That's faster but billed per token, 
 
 ## How it works
 
-- `calorie_bot/bot.py`: Telegram handlers and replies.
+- `calorie_bot/bot.py`: one message router. Short phrases get instant replies; everything
+  else goes to Claude, which returns an *intent* (log, fix, remove, goal, save recipe, …)
+  and the bot acts on it.
 - `calorie_bot/nutrition.py`: the estimate. With `ESTIMATOR=claude-code` the bot runs
-  `claude -p` in a throwaway folder. The meal goes in on stdin and a JSON schema comes back
+  `claude -p` in a throwaway folder. The message goes in on stdin and a JSON schema comes back
   as structured output. Text runs get no tools, and photo runs may only read the photo. At
   most two estimates run at once, to spare the Pi's memory.
 - `calorie_bot/db.py`: SQLite. One row per food item, grouped by meal. "Today" is computed

@@ -1,21 +1,26 @@
-"""Telegram calorie tracker: message it what you ate, it keeps the daily tally."""
+"""Telegram calorie tracker: talk to it in plain language and it keeps the daily tally.
+
+There are no commands. Every message goes through `handle_message`: a few short phrases
+("today", "undo", "yes") are answered directly, everything else is read by Claude, which
+works out what the user wants (log a meal, fix the log, set a goal, save a recipe, ...).
+"""
 
 from __future__ import annotations
 
 import asyncio
 import contextlib
 import html
-import re
 import logging
 import os
+import re
+import time
 import uuid
 from collections import deque
 from zoneinfo import ZoneInfo
 
 from telegram import Update
 from telegram.constants import ChatAction, ParseMode
-from telegram.ext import (Application, CommandHandler, ContextTypes, MessageHandler,
-                          filters)
+from telegram.ext import Application, ContextTypes, MessageHandler, filters
 
 from .db import Entry, Recipe, Store
 from .nutrition import EstimateError, make_estimator
@@ -23,25 +28,18 @@ from .nutrition import EstimateError, make_estimator
 log = logging.getLogger("calorie_bot")
 
 HELP = """<b>Calorie tracker</b>
-Just tell me what you ate, e.g. <i>2 eggs, toast with butter and a latte</i>.
-You can also send a photo of your meal (add a caption for better accuracy).
+Just talk to me. Some things you can say:
 
-/today – what you've eaten today
-/week – daily totals for the last 7 days
-/undo – remove the last meal you logged
-/delete &lt;id&gt; – remove one item (ids are shown in /today)
-/goal &lt;kcal&gt; – set your daily goal (/goal off to clear)
+🍽 <i>2 eggs, toast with butter and a latte</i>, or send a photo of your meal
+📋 <i>what did I eat today?</i> · <i>how did I do this week?</i>
+✏️ <i>actually it was 2 eggs, not 3</i> · <i>remove the toast</i> · <i>undo</i>
+🎯 <i>set my goal to 2000</i> · <i>what's my goal?</i>
 
-<b>Recipes</b>
-/recipe &lt;name&gt; + ingredients on the next lines – save a recipe
-/recipe &lt;name&gt; – show a saved recipe
-/recipes – list your recipes
-/renamerecipe &lt;old&gt; = &lt;new&gt; – rename one
-/deleterecipe &lt;name&gt; – delete one
-You can also just say “save a recipe for …” with the ingredients; I'll make up a name if you don't give one.
-Then log portions like <i>37g dijon vinaigrette</i> or <i>1 serving of chili</i>.
-
-/help – this message"""
+📖 <b>Recipes</b>
+<i>save this as my vinaigrette:</i> and the ingredients (I'll make up a name if you don't give one)
+<i>it makes 4 servings</i> · <i>it weighed 1.6 kg cooked</i>
+<i>37g of the vinaigrette</i> · <i>1 serving of chili</i> · <i>half the batch</i>
+<i>show my recipes</i> · <i>rename it to Dijon vinaigrette</i> · <i>delete the chili recipe</i>"""
 
 
 # ---- formatting -------------------------------------------------------------
@@ -72,11 +70,39 @@ def macro_line(entries: list[Entry]) -> str:
     return f"P {p:.0f}g · C {c:.0f}g · F {f:.0f}g"
 
 
-# ---- handlers ---------------------------------------------------------------
+def today_text(store: Store, user_id: int) -> str:
+    entries = store.entries_for_day(user_id, store.today())
+    if not entries:
+        return "Nothing logged today yet. Tell me what you ate."
+    lines = [f"<b>{store.today():%A %b %-d}</b>"]
+    for e in entries:
+        lines.append(f"{e.eaten_at:%H:%M}  {html.escape(e.item)} — {fmt_kcal(e.calories)}")
+    lines += ["", day_summary(store, user_id), macro_line(entries)]
+    return "\n".join(lines)
 
-async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.effective_message.reply_text(HELP, parse_mode=ParseMode.HTML)
 
+def week_text(store: Store, user_id: int) -> str:
+    days = store.totals_by_day(user_id, 7)
+    goal = store.get_goal(user_id)
+    scale = max([goal or 0] + [t for _, t in days]) or 1
+    lines = ["<b>Last 7 days</b>", "<pre>"]
+    for d, total in days:
+        lines.append(f"{d:%a %d} {total:>6,} {'█' * round(12 * total / scale)}")
+    lines.append("</pre>")
+    logged = [t for _, t in days if t]
+    if logged:
+        lines.append(f"Average (days logged): {fmt_kcal(sum(logged) / len(logged))} kcal")
+    if goal:
+        lines.append(f"Goal: {fmt_kcal(goal)} kcal")
+    return "\n".join(lines)
+
+
+def today_log_for_claude(store: Store, user_id: int) -> list[str]:
+    return [f"#{e.id} {e.eaten_at:%H:%M} {e.item} ({fmt_kcal(e.calories)} kcal)"
+            for e in store.entries_for_day(user_id, store.today())]
+
+
+# ---- conversation memory ----------------------------------------------------
 
 class ChatMemory:
     """The last few messages each way, per user, so "rename it" knows what "it" is.
@@ -111,15 +137,6 @@ class RecordingMessage:
         return getattr(self._msg, name)
 
 
-def remembering(update: Update, ctx: ContextTypes.DEFAULT_TYPE, user_text: str):
-    """Record the user's message; return (context before it, message that records replies)."""
-    memory: ChatMemory = ctx.bot_data.setdefault("memory", ChatMemory())
-    user_id = update.effective_user.id
-    history = memory.lines(user_id)
-    memory.add(user_id, "User", user_text)
-    return history, RecordingMessage(update.effective_message, memory, user_id)
-
-
 async def keep_typing(ctx: ContextTypes.DEFAULT_TYPE, chat_id: int) -> None:
     """Show "typing..." until cancelled (Telegram clears it after ~5s, estimates take longer)."""
     with contextlib.suppress(Exception):
@@ -128,14 +145,66 @@ async def keep_typing(ctx: ContextTypes.DEFAULT_TYPE, chat_id: int) -> None:
             await asyncio.sleep(4)
 
 
-async def log_meal(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+# ---- the router -------------------------------------------------------------
+
+def normalize(text: str) -> str:
+    """'/Today@my_bot!' -> 'today'. Used only for the instant replies below."""
+    text = re.sub(r"^/(\w+)(@\w+)?", r"\1", text.strip().lower())
+    return re.sub(r"[^\w' ]+", "", text).strip()
+
+
+# Short messages answered without asking Claude, so they're instant.
+QUICK = {
+    "today": {"today", "log", "my log", "today's log", "todays log", "what did i eat today",
+              "what have i eaten today", "how many calories left", "calories left", "summary"},
+    "week": {"week", "this week", "my week", "last 7 days", "weekly"},
+    "undo": {"undo", "undo that", "undo last", "scratch that"},
+    "help": {"help", "start", "what can you do", "how does this work", "commands", "menu"},
+    "recipes": {"recipes", "my recipes", "list recipes", "show recipes", "show my recipes"},
+}
+YES_RE = re.compile(r"^(yes|y|yep|yeah|yup|sure|confirm|do it|delete it|ok|okay)\b", re.I)
+NO_RE = re.compile(r"^(no|n|nope|cancel|keep it|don't|dont|stop)\b", re.I)
+CONFIRM_SECONDS = 300
+
+
+def quick_intent(text: str) -> str | None:
+    t = normalize(text)
+    return next((name for name, phrases in QUICK.items() if t in phrases), None)
+
+
+async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     store: Store = ctx.bot_data["store"]
-    estimator = ctx.bot_data["estimator"]
+    memory: ChatMemory = ctx.bot_data.setdefault("memory", ChatMemory())
+    pending: dict = ctx.bot_data.setdefault("pending_delete", {})
     user_id = update.effective_user.id
     raw = update.effective_message
-    text = raw.text or raw.caption
-    history, msg = remembering(update, ctx, (text or "") + (" [photo]" if raw.photo else ""))
+    text = (raw.text or raw.caption or "").strip()
+    history = memory.lines(user_id)
+    memory.add(user_id, "User", text + (" [photo]" if raw.photo else ""))
+    msg = RecordingMessage(raw, memory, user_id)
 
+    # A recipe deletion waiting for "yes"?
+    waiting = pending.pop(user_id, None)
+    if waiting and not raw.photo and time.monotonic() - waiting[1] < CONFIRM_SECONDS:
+        if YES_RE.match(text):
+            await delete_recipe_reply(msg, store, user_id, waiting[0])
+            return
+        if NO_RE.match(text):
+            await msg.reply_text(f"Okay, I kept “{waiting[0]}”.")
+            return
+        # Anything else: drop the pending delete and treat the message normally.
+
+    quick = None if raw.photo else quick_intent(text)
+    if quick:
+        await QUICK_REPLIES[quick](msg, store, user_id)
+        return
+
+    await claude_reply(update, ctx, msg, store, user_id, text, history)
+
+
+async def claude_reply(update, ctx, msg, store: Store, user_id: int, text: str,
+                       history: list[str]) -> None:
+    estimator = ctx.bot_data["estimator"]
     image = None
     if msg.photo:
         tg_file = await msg.photo[-1].get_file()
@@ -143,53 +212,58 @@ async def log_meal(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
     typing = asyncio.create_task(keep_typing(ctx, msg.chat_id))
     try:
-        recipes = store.list_recipes(user_id)
-        result = await estimator.estimate(text=text, image=image,
-                                          recipe_names=[recipe_label(r) for r in recipes],
-                                          history=history)
+        result = await estimator.estimate(
+            text=text or None, image=image,
+            recipe_names=[recipe_label(r) for r in store.list_recipes(user_id)],
+            history=history, today_log=today_log_for_claude(store, user_id))
     except EstimateError as e:
         await msg.reply_text(f"⚠️ {e}")
         return
     finally:
         typing.cancel()
 
-    items = result.get("items") or []
+    intent = result.get("intent")
     note = (result.get("note") or "").strip()
     recipe_out = result.get("recipe") or {}
-    if result.get("intent") == "save_recipe" and recipe_out.get("ingredients"):
+    recipe_name = (recipe_out.get("name") or "").strip()
+    entry_ids = [int(i) for i in result.get("entry_ids") or []]
+    log.info("intent=%s", intent)
+
+    if intent == "save_recipe" and recipe_out.get("ingredients"):
         await save_recipe_and_reply(msg, store, user_id, {**recipe_out, "note": note},
                                     source_text=text or "photo")
-        return
-    intent = result.get("intent")
-    if intent == "update_recipe":
+    elif intent == "update_recipe":
         await update_recipe_and_reply(msg, store, user_id, recipe_out)
-        return
-    if intent in ("rename_recipe", "show_recipe", "list_recipes", "delete_recipe"):
-        await recipe_request_reply(msg, store, user_id, intent,
-                                   (recipe_out.get("name") or "").strip(),
-                                   (result.get("rename_to") or "").strip())
-        return
-    if not items:
+    elif intent == "rename_recipe":
+        await rename_recipe_reply(msg, store, user_id, recipe_name,
+                                  (result.get("rename_to") or "").strip())
+    elif intent == "show_recipe":
+        await show_recipe_reply(msg, store, user_id, recipe_name)
+    elif intent == "list_recipes":
+        await recipes_reply(msg, store, user_id)
+    elif intent == "delete_recipe":
+        await ask_delete_recipe(msg, store, user_id, recipe_name, ctx.bot_data["pending_delete"])
+    elif intent == "show_today":
+        await today_reply(msg, store, user_id)
+    elif intent == "show_week":
+        await week_reply(msg, store, user_id)
+    elif intent == "undo_last":
+        await undo_reply(msg, store, user_id)
+    elif intent == "set_goal":
+        await goal_reply(msg, store, user_id, result.get("goal_kcal") or 0)
+    elif intent == "delete_entries":
+        await delete_entries_reply(msg, store, user_id, entry_ids)
+    elif intent == "help":
+        await help_reply(msg, store, user_id)
+    elif intent in ("log_meal", "correct_log") and result.get("items"):
+        await log_items_reply(msg, store, user_id, result["items"], note, text or "photo",
+                              replace_ids=entry_ids if intent == "correct_log" else [])
+    else:
         await msg.reply_text(note or "I couldn't find any food in that. Try e.g. "
-                             "\"a turkey sandwich and an apple\".")
-        return
+                             "“a turkey sandwich and an apple”, or ask me for help.")
 
-    items, from_recipe, warnings = apply_recipes(store, user_id, items)
-    store.add_items(user_id, text or "photo", items, meal_id=uuid.uuid4().hex)
 
-    lines = ["🍽 <b>Logged</b>"]
-    lines += [f"• {'📖 ' if used else ''}{html.escape(i['item'])} — {fmt_kcal(i['calories'])} kcal"
-              for i, used in zip(items, from_recipe)]
-    meal_total = sum(i["calories"] for i in items)
-    if len(items) > 1:
-        lines.append(f"<b>Meal:</b> {fmt_kcal(meal_total)} kcal")
-    if note:
-        lines.append(f"<i>{html.escape(note)}</i>")
-    lines += [f"⚠️ {html.escape(w)}" for w in warnings]
-    lines.append("")
-    lines.append(day_summary(store, user_id))
-    await msg.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
-
+# ---- logging food -----------------------------------------------------------
 
 def apply_recipes(store: Store, user_id: int,
                   items: list[dict]) -> tuple[list[dict], list[bool], list[str]]:
@@ -213,10 +287,90 @@ def apply_recipes(store: Store, user_id: int,
     return out, used, warnings
 
 
+async def log_items_reply(msg, store: Store, user_id: int, items: list[dict], note: str,
+                          description: str, replace_ids: list[int] | None = None) -> None:
+    items, from_recipe, warnings = apply_recipes(store, user_id, items)
+
+    replaced: list[Entry] = []
+    for entry_id in replace_ids or []:
+        entry = store.delete_entry(user_id, entry_id)
+        if entry:
+            replaced.append(entry)
+    # A correction keeps the original time, so it stays on the right day.
+    eaten_at = min(e.eaten_at for e in replaced) if replaced else None
+    store.add_items(user_id, description, items, meal_id=uuid.uuid4().hex, eaten_at=eaten_at)
+
+    lines = []
+    if replaced:
+        lines.append("✏️ <b>Fixed</b>")
+        lines += [f"• <s>{html.escape(e.item)} — {fmt_kcal(e.calories)} kcal</s>" for e in replaced]
+    else:
+        lines.append("🍽 <b>Logged</b>")
+    lines += [f"• {'📖 ' if used else ''}{html.escape(i['item'])} — {fmt_kcal(i['calories'])} kcal"
+              for i, used in zip(items, from_recipe)]
+    if len(items) > 1:
+        lines.append(f"<b>Meal:</b> {fmt_kcal(sum(i['calories'] for i in items))} kcal")
+    if note:
+        lines.append(f"<i>{html.escape(note)}</i>")
+    lines += [f"⚠️ {html.escape(w)}" for w in warnings]
+    lines += ["", day_summary(store, user_id)]
+    await msg.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
+
+
+async def delete_entries_reply(msg, store: Store, user_id: int, entry_ids: list[int]) -> None:
+    removed = [e for e in (store.delete_entry(user_id, i) for i in entry_ids) if e]
+    if not removed:
+        await msg.reply_text("I couldn't tell which entry you meant. Here's today so far:\n\n"
+                             + today_text(store, user_id), parse_mode=ParseMode.HTML)
+        return
+    lines = ["🗑 <b>Removed</b>"]
+    lines += [f"• {html.escape(e.item)} — {fmt_kcal(e.calories)} kcal" for e in removed]
+    lines += ["", day_summary(store, user_id)]
+    await msg.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
+
+
+async def undo_reply(msg, store: Store, user_id: int) -> None:
+    removed = store.undo_last_meal(user_id)
+    if not removed:
+        await msg.reply_text("Nothing to undo.")
+        return
+    names = ", ".join(html.escape(e.item) for e in removed)
+    await msg.reply_text(f"↩️ Removed {names} ({fmt_kcal(sum(e.calories for e in removed))} kcal)"
+                         f"\n\n{day_summary(store, user_id)}", parse_mode=ParseMode.HTML)
+
+
+async def today_reply(msg, store: Store, user_id: int) -> None:
+    await msg.reply_text(today_text(store, user_id), parse_mode=ParseMode.HTML)
+
+
+async def week_reply(msg, store: Store, user_id: int) -> None:
+    await msg.reply_text(week_text(store, user_id), parse_mode=ParseMode.HTML)
+
+
+async def help_reply(msg, store: Store, user_id: int) -> None:
+    await msg.reply_text(HELP, parse_mode=ParseMode.HTML)
+
+
+async def goal_reply(msg, store: Store, user_id: int, goal: float) -> None:
+    if goal < 0:
+        store.set_goal(user_id, None)
+        await msg.reply_text("Daily goal cleared.")
+    elif goal == 0:
+        current = store.get_goal(user_id)
+        await msg.reply_text(f"Your daily goal is {fmt_kcal(current)} kcal." if current else
+                             "You don't have a daily goal yet. Say e.g. “set my goal to 2000”.")
+    elif 500 <= goal <= 10000:
+        store.set_goal(user_id, int(round(goal)))
+        await msg.reply_text(f"🎯 Daily goal set to {fmt_kcal(goal)} kcal.\n\n"
+                             f"{day_summary(store, user_id)}", parse_mode=ParseMode.HTML)
+    else:
+        await msg.reply_text("That goal looks off. Pick something between 500 and 10,000 kcal.")
+
+
 # ---- recipes ----------------------------------------------------------------
 
 def recipe_label(r: Recipe) -> str:
-    """How a saved recipe is described to Claude when it reads a meal."""
+    """How a saved recipe is described to Claude when it reads a message."""
     servings = f"{r.servings:g} servings" if r.servings else "servings not set"
     return f"{r.name} (whole batch: {r.total_weight_g:g} g, {servings})"
 
@@ -241,18 +395,6 @@ def recipe_card(r: Recipe) -> str:
     return "\n".join(lines)
 
 
-def split_recipe_message(text: str) -> tuple[str, str]:
-    """'/recipe Name\n<ingredients>' or '/recipe Name: <ingredients>' -> (name, ingredients)."""
-    first, _, rest = text.partition("\n")
-    first = first.split(maxsplit=1)[1] if len(first.split(maxsplit=1)) > 1 else ""  # drop /recipe
-    if not rest.strip() and ":" in first:
-        first, _, rest = first.partition(":")
-    name, body = first.strip().strip(":").strip(), rest.strip()
-    if AMOUNT_RE.search(name):
-        name, body = "", f"{name}\n{body}".strip()
-    return name, body
-
-
 SERVINGS_RE = re.compile(
     r"\b(?:serves|yields?|makes)\s+(\d+(?:\.\d+)?)(?![\d.])"
     r"(?!\s*(?:g|kg|grams?|ml|l|liters?|oz|lbs?|pounds?|cups?|quarts?)\b)"
@@ -263,9 +405,6 @@ def servings_in(text: str) -> float:
     """'Totaling 107 servings', 'serves 4', 'makes 6 portions' -> the number; 0 if none."""
     m = SERVINGS_RE.search(text or "")
     return float(m.group(1) or m.group(2)) if m else 0
-
-
-AMOUNT_RE = re.compile(r"\d\s*(g|kg|mg|ml|l|oz|lbs?|cups?|tbsp|tsp|grams?)\b", re.I)
 
 
 def free_name(store: Store, user_id: int, name: str) -> str:
@@ -306,51 +445,10 @@ async def save_recipe_and_reply(msg, store: Store, user_id: int, result: dict,
         lines.append(f"<i>{html.escape(note)}</i>")
     if made_up:
         lines.append(f"\nYou didn't give it a name, so I called it “{html.escape(recipe.name)}”. "
-                     f"To change it: /renamerecipe {html.escape(recipe.name)} = New name")
+                     "To change it, say e.g. “rename it to …”.")
     example = max(5, round(recipe.total_weight_g / 4 / 5) * 5)  # about a quarter of the batch
     lines.append(f"\nLog a portion like: <i>{example:g}g of {html.escape(recipe.name.lower())}</i>")
     await msg.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
-
-
-async def cmd_recipe(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    store: Store = ctx.bot_data["store"]
-    estimator = ctx.bot_data["estimator"]
-    user_id = update.effective_user.id
-    _, msg = remembering(update, ctx, update.effective_message.text or "")
-    name, body = split_recipe_message(msg.text or "")
-
-    if not name and not body:
-        await msg.reply_text(
-            "To save a recipe, put its name after /recipe and the ingredients on the next lines:\n\n"
-            "/recipe Dijon vinaigrette\nDijon mustard 20 g\nOlive oil 5 g\n...\n\n"
-            "Add the finished weight or the number of servings if you know them.")
-        return
-    if name and not body:
-        recipe = store.get_recipe(user_id, name)
-        if recipe:
-            await msg.reply_text(recipe_card(recipe), parse_mode=ParseMode.HTML)
-        else:
-            await msg.reply_text(f"No saved recipe called “{name}”. /recipes lists them; "
-                                 "to save it, put the ingredients on the lines after the name.")
-        return
-
-    typing = asyncio.create_task(keep_typing(ctx, msg.chat_id))
-    try:
-        result = await estimator.estimate_recipe(
-            body, name=name, recipe_names=[r.name for r in store.list_recipes(user_id)])
-    except EstimateError as e:
-        await msg.reply_text(f"⚠️ {e}")
-        return
-    finally:
-        typing.cancel()
-    await save_recipe_and_reply(msg, store, user_id, result, source_text=body, explicit_name=name)
-
-
-async def cmd_recipes(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    store: Store = ctx.bot_data["store"]
-    _, msg = remembering(update, ctx, update.effective_message.text or "/recipes")
-    await msg.reply_text(recipes_list_text(store, update.effective_user.id),
-                         parse_mode=ParseMode.HTML)
 
 
 async def update_recipe_and_reply(msg, store: Store, user_id: int, recipe_out: dict) -> None:
@@ -359,8 +457,7 @@ async def update_recipe_and_reply(msg, store: Store, user_id: int, recipe_out: d
     weight = recipe_out.get("final_weight_g") or 0
     recipe = store.get_recipe(user_id, name) if name else None
     if recipe is None:
-        names = ", ".join(r.name for r in store.list_recipes(user_id)) or "none yet"
-        await msg.reply_text(f"I couldn't tell which recipe you meant. Your recipes: {names}.")
+        await not_found_reply(msg, store, user_id)
         return
     if not (servings > 0 or weight > 0):
         await msg.reply_text(f"What should I change about “{recipe.name}”? You can tell me how "
@@ -379,8 +476,7 @@ async def update_recipe_and_reply(msg, store: Store, user_id: int, recipe_out: d
 def recipes_list_text(store: Store, user_id: int) -> str:
     recipes = store.list_recipes(user_id)
     if not recipes:
-        return ("No saved recipes yet. Send the ingredients and say “save this recipe”, "
-                "or use /recipe.")
+        return ("No saved recipes yet. Send the ingredients and say “save this recipe”.")
     lines = ["📖 <b>Your recipes</b>"]
     for r in recipes:
         serving = f", {fmt_small_kcal(r.calories / r.servings)} per serving" if r.servings else ""
@@ -389,136 +485,60 @@ def recipes_list_text(store: Store, user_id: int) -> str:
     return "\n".join(lines)
 
 
-async def recipe_request_reply(msg, store: Store, user_id: int, intent: str,
-                               name: str, new_name: str) -> None:
-    if intent == "list_recipes":
-        await msg.reply_text(recipes_list_text(store, user_id), parse_mode=ParseMode.HTML)
-        return
+async def recipes_reply(msg, store: Store, user_id: int) -> None:
+    await msg.reply_text(recipes_list_text(store, user_id), parse_mode=ParseMode.HTML)
+
+
+async def not_found_reply(msg, store: Store, user_id: int) -> None:
+    names = ", ".join(r.name for r in store.list_recipes(user_id)) or "none yet"
+    await msg.reply_text(f"I couldn't tell which recipe you meant. Your recipes: {names}.")
+
+
+async def show_recipe_reply(msg, store: Store, user_id: int, name: str) -> None:
     recipe = store.get_recipe(user_id, name) if name else None
     if recipe is None:
-        names = ", ".join(r.name for r in store.list_recipes(user_id)) or "none yet"
-        await msg.reply_text(f"I couldn't tell which recipe you meant. Your recipes: {names}.")
+        await not_found_reply(msg, store, user_id)
         return
-    if intent == "show_recipe":
-        await msg.reply_text(recipe_card(recipe), parse_mode=ParseMode.HTML)
-    elif intent == "delete_recipe":
-        # Deleting is permanent, so a plain message only offers it; the command does it.
-        await msg.reply_text(f"To delete “{recipe.name}”, send:\n/deleterecipe {recipe.name}")
-    elif intent == "rename_recipe":
-        if not new_name:
-            await msg.reply_text(f"What should I rename “{recipe.name}” to?")
-            return
-        result = store.rename_recipe(user_id, recipe.name, new_name)
-        replies = {"ok": f"✅ Renamed “{recipe.name}” to “{new_name}”.",
-                   "taken": f"You already have a recipe called “{new_name}”. "
-                            "Delete or rename that one first."}
-        await msg.reply_text(replies.get(result, f"No saved recipe called “{recipe.name}”."))
+    await msg.reply_text(recipe_card(recipe), parse_mode=ParseMode.HTML)
 
 
-async def cmd_renamerecipe(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    store: Store = ctx.bot_data["store"]
-    old, sep, new = " ".join(ctx.args).partition("=")
-    old, new = old.strip(), new.strip()
-    if not (sep and old and new):
-        await update.effective_message.reply_text("Usage: /renamerecipe Old name = New name")
+async def rename_recipe_reply(msg, store: Store, user_id: int, name: str, new_name: str) -> None:
+    recipe = store.get_recipe(user_id, name) if name else None
+    if recipe is None:
+        await not_found_reply(msg, store, user_id)
         return
-    result = store.rename_recipe(update.effective_user.id, old, new)
-    replies = {"ok": f"Renamed “{old}” to “{new}”.",
-               "missing": f"No saved recipe called “{old}”.",
-               "taken": f"You already have a recipe called “{new}”. Delete or rename that one first."}
-    await update.effective_message.reply_text(replies[result])
+    if not new_name:
+        await msg.reply_text(f"What should I rename “{recipe.name}” to?")
+        return
+    result = store.rename_recipe(user_id, recipe.name, new_name)
+    replies = {"ok": f"✅ Renamed “{recipe.name}” to “{new_name}”.",
+               "taken": f"You already have a recipe called “{new_name}”. "
+                        "Delete or rename that one first."}
+    await msg.reply_text(replies.get(result, f"No saved recipe called “{recipe.name}”."))
 
 
-async def cmd_deleterecipe(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    store: Store = ctx.bot_data["store"]
-    name = " ".join(ctx.args)
-    if not name:
-        await update.effective_message.reply_text("Usage: /deleterecipe <name>")
-    elif store.delete_recipe(update.effective_user.id, name):
-        await update.effective_message.reply_text(f"🗑 Deleted the recipe “{name}”. "
-                                                  "Meals you already logged with it stay as they are.")
+async def ask_delete_recipe(msg, store: Store, user_id: int, name: str, pending: dict) -> None:
+    recipe = store.get_recipe(user_id, name) if name else None
+    if recipe is None:
+        await not_found_reply(msg, store, user_id)
+        return
+    pending[user_id] = (recipe.name, time.monotonic())
+    await msg.reply_text(f"Delete the recipe “{recipe.name}”? Reply yes to delete it or no to keep "
+                         "it. Meals you already logged with it won't change.")
+
+
+async def delete_recipe_reply(msg, store: Store, user_id: int, name: str) -> None:
+    if store.delete_recipe(user_id, name):
+        await msg.reply_text(f"🗑 Deleted the recipe “{name}”.")
     else:
-        await update.effective_message.reply_text(f"No saved recipe called “{name}”.")
+        await msg.reply_text(f"“{name}” was already gone.")
 
 
-async def cmd_today(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    store: Store = ctx.bot_data["store"]
-    user_id = update.effective_user.id
-    entries = store.entries_for_day(user_id, store.today())
-    if not entries:
-        await update.effective_message.reply_text("Nothing logged today yet.")
-        return
-    lines = [f"<b>{store.today():%A %b %-d}</b>"]
-    for e in entries:
-        lines.append(f"<code>{e.id:>4}</code> {e.eaten_at:%H:%M} {html.escape(e.item)}"
-                     f" — {fmt_kcal(e.calories)}")
-    lines += ["", day_summary(store, user_id), macro_line(entries)]
-    await update.effective_message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
+QUICK_REPLIES = {"today": today_reply, "week": week_reply, "undo": undo_reply,
+                 "help": help_reply, "recipes": recipes_reply}
 
 
-async def cmd_week(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    store: Store = ctx.bot_data["store"]
-    user_id = update.effective_user.id
-    days = store.totals_by_day(user_id, 7)
-    goal = store.get_goal(user_id)
-    scale = max([goal or 0] + [t for _, t in days]) or 1
-    lines = ["<b>Last 7 days</b>", "<pre>"]
-    for d, total in days:
-        bar = "█" * round(12 * total / scale)
-        lines.append(f"{d:%a %d} {total:>6,} {bar}")
-    lines.append("</pre>")
-    logged = [t for _, t in days if t]
-    if logged:
-        lines.append(f"Average (days logged): {fmt_kcal(sum(logged) / len(logged))} kcal")
-    if goal:
-        lines.append(f"Goal: {fmt_kcal(goal)} kcal")
-    await update.effective_message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
-
-
-async def cmd_undo(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    store: Store = ctx.bot_data["store"]
-    removed = store.undo_last_meal(update.effective_user.id)
-    if not removed:
-        await update.effective_message.reply_text("Nothing to undo.")
-        return
-    names = ", ".join(html.escape(e.item) for e in removed)
-    kcal = sum(e.calories for e in removed)
-    await update.effective_message.reply_text(
-        f"↩️ Removed {names} ({fmt_kcal(kcal)} kcal)\n\n"
-        f"{day_summary(store, update.effective_user.id)}", parse_mode=ParseMode.HTML)
-
-
-async def cmd_delete(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    store: Store = ctx.bot_data["store"]
-    if not ctx.args or not ctx.args[0].isdigit():
-        await update.effective_message.reply_text("Usage: /delete <id> (ids are in /today)")
-        return
-    entry = store.delete_entry(update.effective_user.id, int(ctx.args[0]))
-    if entry is None:
-        await update.effective_message.reply_text("No entry with that id.")
-        return
-    await update.effective_message.reply_text(
-        f"🗑 Removed {html.escape(entry.item)} ({fmt_kcal(entry.calories)} kcal)\n\n"
-        f"{day_summary(store, update.effective_user.id)}", parse_mode=ParseMode.HTML)
-
-
-async def cmd_goal(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    store: Store = ctx.bot_data["store"]
-    user_id = update.effective_user.id
-    arg = ctx.args[0].replace(",", "") if ctx.args else ""
-    if arg.lower() in ("off", "none", "clear"):
-        store.set_goal(user_id, None)
-        await update.effective_message.reply_text("Daily goal cleared.")
-    elif arg.isdigit() and 500 <= int(arg) <= 10000:
-        store.set_goal(user_id, int(arg))
-        await update.effective_message.reply_text(
-            f"Daily goal set to {fmt_kcal(int(arg))} kcal.\n\n{day_summary(store, user_id)}",
-            parse_mode=ParseMode.HTML)
-    else:
-        goal = store.get_goal(user_id)
-        current = f"Current goal: {fmt_kcal(goal)} kcal. " if goal else ""
-        await update.effective_message.reply_text(f"{current}Usage: /goal 2000 (or /goal off)")
-
+# ---- access and errors ------------------------------------------------------
 
 async def unauthorized(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     uid = update.effective_user.id if update.effective_user else "?"
@@ -556,17 +576,8 @@ def build_app() -> Application:
         log.warning("ALLOWED_USER_IDS is empty: nobody can use the bot until you set it.")
         me = filters.User(user_id=[])
 
-    app.add_handler(CommandHandler(["start", "help"], cmd_help, filters=me))
-    app.add_handler(CommandHandler("today", cmd_today, filters=me))
-    app.add_handler(CommandHandler("week", cmd_week, filters=me))
-    app.add_handler(CommandHandler("undo", cmd_undo, filters=me))
-    app.add_handler(CommandHandler("delete", cmd_delete, filters=me))
-    app.add_handler(CommandHandler("goal", cmd_goal, filters=me))
-    app.add_handler(CommandHandler("recipe", cmd_recipe, filters=me))
-    app.add_handler(CommandHandler("recipes", cmd_recipes, filters=me))
-    app.add_handler(CommandHandler("deleterecipe", cmd_deleterecipe, filters=me))
-    app.add_handler(CommandHandler("renamerecipe", cmd_renamerecipe, filters=me))
-    app.add_handler(MessageHandler(me & (filters.TEXT | filters.PHOTO) & ~filters.COMMAND, log_meal))
+    # One handler for everything, slash-prefixed text included: there are no commands.
+    app.add_handler(MessageHandler(me & (filters.TEXT | filters.PHOTO), handle_message))
     app.add_handler(MessageHandler(~me, unauthorized))
     app.add_error_handler(on_error)
     return app

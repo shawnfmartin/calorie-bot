@@ -1,5 +1,6 @@
 import asyncio
 import json
+import re
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
@@ -101,7 +102,7 @@ def test_build_app_registers_handlers(tmp_path, monkeypatch):
     monkeypatch.setenv("DB_PATH", str(tmp_path / "c.db"))
     from calorie_bot.bot import build_app
     app = build_app()
-    assert len(app.handlers[0]) == 12
+    assert len(app.handlers[0]) == 2  # one router for everything, plus the private-bot reply
 
 
 # ---- Claude Code backend, against a fake `claude` executable ---------------------------
@@ -170,7 +171,7 @@ def test_claude_code_missing_binary():
 
 # ---- recipes -----------------------------------------------------------------------
 
-from calorie_bot.bot import apply_recipes, recipe_card, split_recipe_message  # noqa: E402
+from calorie_bot.bot import apply_recipes, recipe_card  # noqa: E402
 
 VINAIGRETTE = [  # 120 g, 92 kcal
     {"ingredient": "Dijon mustard", "grams": 20, "calories": 15, "protein_g": 1, "carbs_g": 1, "fat_g": 1},
@@ -231,17 +232,6 @@ def test_recipe_card_renders(tmp_path):
     assert "makes 4): 23 kcal" in card
 
 
-@pytest.mark.parametrize("text,name,body", [
-    ("/recipe Dijon vinaigrette\nDijon mustard\t20 g\nWater\t55 g",
-     "Dijon vinaigrette", "Dijon mustard\t20 g\nWater\t55 g"),
-    ("/recipe@shawn_calorie_tracker_bot Chili: beans 400g, beef 500g", "Chili", "beans 400g, beef 500g"),
-    ("/recipe Dijon vinaigrette", "Dijon vinaigrette", ""),
-    ("/recipe", "", ""),
-])
-def test_split_recipe_message(text, name, body):
-    assert split_recipe_message(text) == (name, body)
-
-
 def test_meal_prompt_lists_saved_recipes(fake_claude):
     parsed = {"items": [], "note": "hi"}
     _, calls = fake_claude({"is_error": False, "structured_output": parsed}, text="37g dijon with lunch",
@@ -267,12 +257,6 @@ def recipe_result(name="", name_given=False, note=""):
             "final_weight_g": 0, "servings": 0, "note": note}
 
 
-def test_split_treats_ingredient_first_line_as_body():
-    assert split_recipe_message("/recipe Dijon mustard 20 g\nWater 55 g") == \
-        ("", "Dijon mustard 20 g\nWater 55 g")
-    assert split_recipe_message("/recipe\nDijon mustard 20 g") == ("", "Dijon mustard 20 g")
-
-
 def test_made_up_title_never_overwrites(tmp_path):
     s = Store(tmp_path / "t.db", TZ)
     msg = FakeMsg()
@@ -280,7 +264,7 @@ def test_made_up_title_never_overwrites(tmp_path):
     asyncio.run(save_recipe_and_reply(msg, s, 1, recipe_result("Honey dijon vinaigrette"), "src"))
     assert [r.name for r in s.list_recipes(1)] == ["Honey dijon vinaigrette", "Honey dijon vinaigrette 2"]
     assert "I called it “Honey dijon vinaigrette 2”" in msg.replies[1]
-    assert "/renamerecipe Honey dijon vinaigrette 2 = New name" in msg.replies[1]
+    assert "rename it to" in msg.replies[1] and not re.search(r"(^|\s)/\w", msg.replies[1])
     assert free_name(s, 1, "Chili") == "Chili"
 
 
@@ -376,7 +360,7 @@ def test_recipe_label(tmp_path):
 
 # ---- context, plain-language recipe requests, servings backup ------------------------
 
-from calorie_bot.bot import ChatMemory, RecordingMessage, recipe_request_reply, servings_in  # noqa: E402
+from calorie_bot.bot import ChatMemory, RecordingMessage, servings_in  # noqa: E402
 from calorie_bot.nutrition import meal_prompt  # noqa: E402
 
 
@@ -418,20 +402,148 @@ def test_meal_prompt_includes_history():
     assert p.endswith("My saved recipes: Vinaigrette (whole batch: 104 g, 107 servings)")
 
 
-def test_plain_language_rename_show_list_delete(tmp_path):
-    s = Store(tmp_path / "t.db", TZ)
-    s.save_recipe(1, "Vinaigrette", VINAIGRETTE, 0, 107, "src")
-    msg = FakeMsg()
-    run = lambda *a: asyncio.run(recipe_request_reply(msg, s, 1, *a))
-    run("rename_recipe", "Vinaigrette", "Dijon vinaigrette")
-    assert msg.replies[-1] == "✅ Renamed “Vinaigrette” to “Dijon vinaigrette”."
-    assert s.get_recipe(1, "dijon vinaigrette") is not None
-    run("show_recipe", "Dijon vinaigrette", "")
-    assert "📖 <b>Dijon vinaigrette</b>" in msg.replies[-1]
-    run("list_recipes", "", "")
-    assert "Dijon vinaigrette" in msg.replies[-1]
-    run("delete_recipe", "Dijon vinaigrette", "")
-    assert "/deleterecipe Dijon vinaigrette" in msg.replies[-1]
-    assert s.get_recipe(1, "dijon vinaigrette") is not None          # not deleted from plain text
-    run("rename_recipe", "Soup", "Stew")
-    assert "couldn't tell which recipe" in msg.replies[-1]
+# ---- the plain-language router ------------------------------------------------------
+
+from types import SimpleNamespace as NS  # noqa: E402
+
+from calorie_bot.bot import handle_message, normalize, quick_intent  # noqa: E402
+
+EMPTY_RECIPE = {"name": "", "name_given": False, "ingredients": [], "final_weight_g": 0, "servings": 0}
+
+
+def claude_says(intent, **fields):
+    return {"intent": intent, "items": [], "entry_ids": [], "goal_kcal": 0,
+            "recipe": dict(EMPTY_RECIPE), "rename_to": "", "note": "", **fields}
+
+
+class ScriptedEstimator:
+    """Stands in for Claude: returns queued results and records what it was asked."""
+
+    def __init__(self):
+        self.queue, self.calls = [], []
+
+    async def estimate(self, **kwargs):
+        self.calls.append(kwargs)
+        return self.queue.pop(0)
+
+
+class Chat:
+    """Drives handle_message the way Telegram would, one user, one chat."""
+
+    def __init__(self, tmp_path):
+        self.store = Store(tmp_path / "t.db", TZ)
+        self.claude = ScriptedEstimator()
+        self.ctx = NS(bot_data={"store": self.store, "estimator": self.claude}, bot=self)
+        self.replies = []
+
+    async def send_chat_action(self, *a):
+        pass
+
+    def say(self, text, then=None):
+        if then is not None:
+            self.claude.queue.append(then)
+        chat = self
+
+        class Msg:
+            photo, caption, chat_id = None, None, 1
+
+            async def reply_text(self, t, **k):
+                chat.replies.append(t)
+
+        m = Msg()
+        m.text = text
+        asyncio.run(handle_message(NS(effective_message=m, effective_user=NS(id=1)), self.ctx))
+        return self.replies[-1]
+
+
+@pytest.mark.parametrize("text,intent", [
+    ("today", "today"), ("/today", "today"), ("What did I eat today?", "today"),
+    ("/week@shawn_calorie_tracker_bot", "week"), ("Undo", "undo"), ("/start", "help"),
+    ("my recipes", "recipes"), ("2 eggs", None), ("today I had 2 eggs", None),
+])
+def test_quick_intents(text, intent):
+    assert quick_intent(text) == intent
+
+
+def test_normalize():
+    assert normalize("/Today@my_bot!") == "today"
+
+
+def test_quick_replies_skip_claude(tmp_path):
+    chat = Chat(tmp_path)
+    assert "Nothing logged today" in chat.say("today")
+    assert "Last 7 days" in chat.say("/week")
+    assert "Just talk to me" in chat.say("/start")
+    assert "/" not in chat.say("help").replace("</", "")   # help mentions no commands
+    assert chat.claude.calls == []
+
+
+def test_log_then_correct_then_remove(tmp_path):
+    chat = Chat(tmp_path)
+    reply = chat.say("3 eggs", claude_says("log_meal", items=[{**item("3 large eggs", 215), "recipe": "",
+                     "recipe_grams": 0, "recipe_servings": 0, "recipe_fraction": 0}]))
+    assert "Logged" in reply and "215" in reply
+    eggs = chat.store.entries_for_day(1, chat.store.today())[0]
+    assert chat.claude.calls[-1]["today_log"] == []
+
+    chat.say("actually it was 2 eggs", claude_says("correct_log", entry_ids=[eggs.id], items=[{
+        **item("2 large eggs", 143), "recipe": "", "recipe_grams": 0, "recipe_servings": 0,
+        "recipe_fraction": 0}]))
+    assert f"#{eggs.id}" in chat.claude.calls[-1]["today_log"][0]          # Claude saw the log
+    assert "Fixed" in chat.replies[-1] and "<s>3 large eggs" in chat.replies[-1]
+    [fixed] = chat.store.entries_for_day(1, chat.store.today())
+    assert fixed.item == "2 large eggs" and fixed.eaten_at == eggs.eaten_at  # kept the time
+
+    reply = chat.say("remove the eggs", claude_says("delete_entries", entry_ids=[fixed.id]))
+    assert "Removed" in reply and chat.store.entries_for_day(1, chat.store.today()) == []
+    assert "couldn't tell which entry" in chat.say("remove the toast",
+                                                   claude_says("delete_entries", entry_ids=[999]))
+
+
+def test_goal_in_plain_words(tmp_path):
+    chat = Chat(tmp_path)
+    assert "don't have a daily goal" in chat.say("what's my goal", claude_says("set_goal"))
+    assert "2,000" in chat.say("set my goal to 2000", claude_says("set_goal", goal_kcal=2000))
+    assert chat.store.get_goal(1) == 2000
+    assert "looks off" in chat.say("goal 20", claude_says("set_goal", goal_kcal=20))
+    assert "cleared" in chat.say("no more goal", claude_says("set_goal", goal_kcal=-1))
+    assert chat.store.get_goal(1) is None
+
+
+def test_recipe_rename_show_list_in_plain_words(tmp_path):
+    chat = Chat(tmp_path)
+    chat.store.save_recipe(1, "Vinaigrette", VINAIGRETTE, 0, 107, "src")
+    named = lambda n: {**EMPTY_RECIPE, "name": n}
+    assert chat.say("rename to dijon vinegrette", claude_says(
+        "rename_recipe", recipe=named("Vinaigrette"), rename_to="Dijon vinaigrette")) == \
+        "✅ Renamed “Vinaigrette” to “Dijon vinaigrette”."
+    assert "📖 <b>Dijon vinaigrette</b>" in chat.say("show it", claude_says("show_recipe",
+                                                                          recipe=named("Dijon vinaigrette")))
+    assert "Dijon vinaigrette" in chat.say("recipes")
+    assert "couldn't tell which recipe" in chat.say("show soup", claude_says("show_recipe",
+                                                                           recipe=named("Soup")))
+    # The rename reply was remembered, so Claude gets it as context next time.
+    assert any("Renamed" in line for line in chat.claude.calls[-1]["history"])
+
+
+def test_recipe_delete_needs_yes(tmp_path):
+    chat = Chat(tmp_path)
+    chat.store.save_recipe(1, "Chili", VINAIGRETTE, 0, 0, "src")
+    ask = claude_says("delete_recipe", recipe={**EMPTY_RECIPE, "name": "Chili"})
+    assert "Reply yes to delete" in chat.say("delete the chili recipe", ask)
+    assert "kept “Chili”" in chat.say("no")
+    assert chat.store.get_recipe(1, "chili") is not None
+
+    chat.say("delete the chili recipe", dict(ask))
+    assert "Deleted the recipe “Chili”" in chat.say("yes")
+    assert chat.store.get_recipe(1, "chili") is None
+    assert len(chat.claude.calls) == 2                       # "yes" and "no" never went to Claude
+
+
+def test_unrelated_message_cancels_pending_delete(tmp_path):
+    chat = Chat(tmp_path)
+    chat.store.save_recipe(1, "Chili", VINAIGRETTE, 0, 0, "src")
+    chat.say("delete chili", claude_says("delete_recipe", recipe={**EMPTY_RECIPE, "name": "Chili"}))
+    chat.say("today")                                         # something else in between
+    chat.say("yes", claude_says("other", note="Yes to what?"))
+    assert chat.store.get_recipe(1, "chili") is not None      # "yes" no longer deletes

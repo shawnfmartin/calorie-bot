@@ -39,7 +39,10 @@ main ingredients and the kind of dish (e.g. "Honey dijon vinaigrette", "Beef and
 and set `name_given` to false. Don't mention the name in `note`: the bot tells the user."""
 
 MEAL_PROMPT = """You are the nutrition engine behind a personal calorie-tracking Telegram bot.
-The user tells you (in text, a photo, or both) what they ate. Break it into individual food items
+The user messages the bot in plain language (text, a photo, or both) for everything: logging
+what they ate, checking or fixing their log, their goal, and saving and managing recipes. There
+are no commands; a message may still start with "/" out of habit ("/today"): treat it the same.
+When they tell you what they ate, break it into individual food items
 and estimate calories and macros for each, using typical portion sizes when none is given
 (e.g. "a bowl of oatmeal" ~ 1 cup cooked). Use the user's quantities and brands when stated.
 Name each item with its portion, e.g. "2 large eggs, scrambled in butter".
@@ -63,16 +66,25 @@ Still fill in your own best calorie and macro estimate for the item; the bot rep
 the recipe's exact numbers. For items that are not a saved recipe, set `recipe` to "" and all
 three amounts to 0.
 
-Set `intent` to one of:
+Set `intent` to exactly one of:
 - "log_meal": the user is telling you what they ate or drank. Fill `items`.
+- "correct_log": the user is fixing something already in today's log ("actually it was 2 eggs,
+  not 3", "the rice was 150g"). Put the ids of the log entries being replaced in `entry_ids` and
+  the corrected food in `items` (only the corrected entries, not the rest of the meal).
+- "delete_entries": the user wants entries removed from today's log ("remove the arugula",
+  "delete lunch", "I didn't eat the toast"). Put their ids in `entry_ids`.
+- "undo_last": the user wants to undo the last meal they logged ("undo", "scratch that").
+- "show_today": the user wants to see what they ate today or how many calories they have left.
+- "show_week": the user wants to see the last few days or their weekly progress.
+- "set_goal": the user is setting, changing, clearing or asking about their daily calorie goal.
+  Put the new goal in `goal_kcal`; -1 to clear it; 0 if they are only asking what it is.
 - "save_recipe": the user wants to save, create, add or update a recipe for later (e.g. "make a
   recipe for...", "save this as...", or a bare ingredient list with amounts that reads like a
-  recipe rather than a meal). Leave `items` empty and fill `recipe` as described below.
+  recipe rather than a meal). Fill `recipe` as described below.
 - "update_recipe": the user is adding or changing how many servings a saved recipe makes, or its
   finished weight, without giving ingredients (e.g. "my vinaigrette makes 4 servings", "the chili
-  weighed 1.6 kg after cooking"). Leave `items` empty; set `recipe.name` to the saved recipe's
-  exact name, `recipe.servings` and/or `recipe.final_weight_g` to the new values (0 for anything
-  not mentioned), and no ingredients.
+  weighed 1.6 kg after cooking"). Set `recipe.name` to the saved recipe's exact name, and
+  `recipe.servings` and/or `recipe.final_weight_g` to the new values (0 for anything not mentioned).
 - "rename_recipe": the user wants to rename a saved recipe ("rename it to Dijon vinaigrette",
   "call the chili Turkey chili"). Set `recipe.name` to the saved recipe's exact current name
   (use the recent messages to resolve "it") and `rename_to` to the new name, written as they
@@ -80,23 +92,18 @@ Set `intent` to one of:
 - "show_recipe": the user wants to see a saved recipe. Set `recipe.name` to its exact name.
 - "list_recipes": the user wants to see all their saved recipes.
 - "delete_recipe": the user wants to delete a saved recipe. Set `recipe.name` to its exact name.
-- "other": anything else (a greeting, a question, something unrelated). Leave `items` empty and
-  put a short helpful reply in `note`.
-For every intent except "save_recipe", leave `recipe.ingredients` empty; set `recipe.name` only
-where described above, and the rest of `recipe` to empty or zero. Set `rename_to` to "" except
-for "rename_recipe".
+  (The bot asks them to confirm.)
+- "help": the user is asking what the bot can do or how to use it.
+- "other": anything else (a greeting, a question, something unrelated). Put a short helpful reply
+  in `note`.
+Only fill the fields an intent uses. Leave the rest empty: `items` [], `entry_ids` [],
+`goal_kcal` 0, `rename_to` "", and `recipe` with an empty name, no ingredients and zeros (except
+`recipe.name` where described above).
 
 Recipe rules:
 """ + RECIPE_RULES + """
 
 Keep `note` to one short sentence about any assumption you made, or leave it empty."""
-
-RECIPE_PROMPT = """You are the nutrition engine behind a personal calorie-tracking Telegram bot.
-The user is saving a recipe so they can log portions of it later.
-""" + RECIPE_RULES + """
-
-Keep `note` to one short sentence about any assumption you made, or leave it empty.
-If the message contains no ingredients, return an empty ingredients list and explain in `note`."""
 
 _MACROS = {
     "calories": {"type": "number"},
@@ -124,6 +131,10 @@ _RECIPE_PROPS = {
 }
 _RECIPE_KEYS = list(_RECIPE_PROPS)
 
+INTENTS = ["log_meal", "correct_log", "delete_entries", "undo_last", "show_today", "show_week",
+           "set_goal", "save_recipe", "update_recipe", "rename_recipe", "show_recipe",
+           "list_recipes", "delete_recipe", "help", "other"]
+
 MEAL_SCHEMA = {
     "type": "object",
     "properties": {
@@ -144,22 +155,15 @@ MEAL_SCHEMA = {
                 "additionalProperties": False,
             },
         },
-        "intent": {"type": "string", "enum": ["log_meal", "save_recipe", "update_recipe", "rename_recipe",
-                                             "show_recipe", "list_recipes", "delete_recipe",
-                                             "other"]},
+        "intent": {"type": "string", "enum": INTENTS},
+        "entry_ids": {"type": "array", "items": {"type": "integer"}},
+        "goal_kcal": {"type": "number"},
         "rename_to": {"type": "string"},
         "recipe": {"type": "object", "properties": _RECIPE_PROPS, "required": _RECIPE_KEYS,
                    "additionalProperties": False},
         "note": {"type": "string"},
     },
-    "required": ["intent", "items", "recipe", "rename_to", "note"],
-    "additionalProperties": False,
-}
-
-RECIPE_SCHEMA = {
-    "type": "object",
-    "properties": {**_RECIPE_PROPS, "note": {"type": "string"}},
-    "required": [*_RECIPE_KEYS, "note"],
+    "required": ["intent", "items", "entry_ids", "goal_kcal", "recipe", "rename_to", "note"],
     "additionalProperties": False,
 }
 
@@ -171,7 +175,7 @@ class EstimateError(Exception):
 
 
 def meal_prompt(text: str | None, recipe_names: list[str] | None,
-                history: list[str] | None = None) -> str:
+                history: list[str] | None = None, today_log: list[str] | None = None) -> str:
     prompt = ""
     if history:
         prompt += "Recent messages, oldest first (context only):\n" + "\n".join(history) + "\n\n"
@@ -179,6 +183,8 @@ def meal_prompt(text: str | None, recipe_names: list[str] | None,
     prompt += text or "Here's a photo of what I ate."
     if recipe_names:
         prompt += "\n\nMy saved recipes: " + "; ".join(recipe_names)
+    if today_log:
+        prompt += "\n\nToday's log (id, time, item, kcal):\n" + "\n".join(today_log)
     return prompt
 
 
@@ -188,16 +194,11 @@ class _Estimator:
     async def estimate(self, text: str | None = None, image: bytes | None = None,
                        image_type: str = "image/jpeg",
                        recipe_names: list[str] | None = None,
-                       history: list[str] | None = None) -> dict:
-        return await self._structured(MEAL_PROMPT, MEAL_SCHEMA,
-                                      meal_prompt(text, recipe_names, history), image, image_type)
-
-    async def estimate_recipe(self, text: str, name: str = "",
-                              recipe_names: list[str] | None = None) -> dict:
-        prompt = (f"Recipe name: {name}\n\n" if name else "") + text
-        if recipe_names:
-            prompt += "\n\nMy saved recipes: " + "; ".join(recipe_names)
-        return await self._structured(RECIPE_PROMPT, RECIPE_SCHEMA, prompt, None, "image/jpeg")
+                       history: list[str] | None = None,
+                       today_log: list[str] | None = None) -> dict:
+        return await self._structured(
+            MEAL_PROMPT, MEAL_SCHEMA, meal_prompt(text, recipe_names, history, today_log),
+            image, image_type)
 
     async def _structured(self, system: str, schema: dict, prompt: str,
                           image: bytes | None, image_type: str) -> dict:
