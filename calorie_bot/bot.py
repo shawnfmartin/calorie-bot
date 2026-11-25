@@ -216,6 +216,41 @@ YES_RE = re.compile(r"^(yes|y|yep|yeah|yup|sure|confirm|do it|delete it|ok|okay)
 NO_RE = re.compile(r"^(no|n|nope|cancel|keep it|don't|dont|stop)\b", re.I)
 CONFIRM_SECONDS = 300
 
+# ---- guardrails: things that never need Claude ---------------------------------------
+GREETINGS = {"hi", "hello", "hey", "hiya", "yo", "sup", "good morning", "morning",
+             "good afternoon", "good evening", "hi there", "hello there", "hey there"}
+ACKS = {"thanks", "thank you", "thanks a lot", "thank you so much", "thx", "ty", "tysm",
+        "cool", "nice", "great", "awesome", "perfect", "ok", "okay", "k", "kk", "got it",
+        "sounds good", "lol", "haha", "good", "alright", "sweet", "noted", "will do"}
+
+
+def max_message_chars() -> int:
+    return int(os.environ.get("MAX_MESSAGE_CHARS", "3000"))
+
+
+def daily_claude_limit() -> int:
+    """Claude calls allowed per person per day; 0 means no limit."""
+    return int(os.environ.get("CLAUDE_DAILY_LIMIT", "100"))
+
+
+def free_reply(text: str, has_photo: bool) -> str | None:
+    """A canned reply for messages that don't need Claude, or None to ask Claude."""
+    if has_photo:
+        return None
+    t = normalize(text)
+    if not text.strip():
+        return ""                                   # nothing to answer (e.g. a sticker)
+    if not re.search(r"[^\W_]", text):              # emoji or punctuation only
+        return "👍"
+    if t in GREETINGS:
+        return "Hi! Tell me what you ate, or say “help” to see what I can do."
+    if t in ACKS:
+        return "👍"
+    if len(text) > max_message_chars():
+        return (f"That message is too long for me ({len(text):,} characters; the limit is "
+                f"{max_message_chars():,}). Send just the food, or the recipe's ingredients.")
+    return None
+
 
 def quick_intent(text: str) -> str | None:
     t = normalize(text)
@@ -247,6 +282,20 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None
     quick = None if raw.photo else quick_intent(text)
     if quick:
         await QUICK_REPLIES[quick](msg, store, user_id)
+        return
+
+    canned = free_reply(text, bool(raw.photo))
+    if canned is not None:
+        if canned:
+            await msg.reply_text(canned)
+        return
+
+    limit = daily_claude_limit()
+    if limit and store.count_claude_call(user_id) > limit:
+        log.warning("user %s hit the daily limit of %s Claude calls", user_id, limit)
+        await msg.reply_text(f"You've reached today's limit of {limit} messages that need "
+                             "Claude. It resets at midnight. “today”, “undo” and “help” "
+                             "still work.")
         return
 
     await claude_reply(update, ctx, msg, store, user_id, text, history)

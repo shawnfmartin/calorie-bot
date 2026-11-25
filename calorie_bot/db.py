@@ -51,6 +51,13 @@ CREATE TABLE IF NOT EXISTS settings (
     health_token TEXT                      -- secret in the user's Apple Health sync link
 );
 
+CREATE TABLE IF NOT EXISTS claude_usage (   -- Claude calls per person per day, for the daily cap
+    user_id INTEGER NOT NULL,
+    day     TEXT    NOT NULL,
+    calls   INTEGER NOT NULL,
+    PRIMARY KEY (user_id, day)
+);
+
 CREATE TABLE IF NOT EXISTS health_synced (  -- days already logged into Apple Health
     user_id   INTEGER NOT NULL,
     day       TEXT    NOT NULL,             -- YYYY-MM-DD, local time
@@ -321,6 +328,16 @@ class Store:
         return Recipe(r["id"], r["name"], json.loads(r["ingredients"]), r["total_weight_g"],
                       r["servings"], r["calories"], r["protein_g"], r["carbs_g"], r["fat_g"],
                       r["raw_weight_g"], r["weight_basis"])
+
+    def count_claude_call(self, user_id: int) -> int:
+        """Record one Claude call for today; returns today's total including this one."""
+        day = self.today().isoformat()
+        self.conn.execute(
+            "INSERT INTO claude_usage (user_id, day, calls) VALUES (?, ?, 1)"
+            " ON CONFLICT(user_id, day) DO UPDATE SET calls = calls + 1", (user_id, day))
+        self.conn.commit()
+        return self.conn.execute("SELECT calls FROM claude_usage WHERE user_id=? AND day=?",
+                                 (user_id, day)).fetchone()["calls"]
 
     # ---- Apple Health sync ---------------------------------------------------
 

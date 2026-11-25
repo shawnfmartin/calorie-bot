@@ -809,3 +809,50 @@ def test_configured_timezone(monkeypatch):
     assert str(configured_timezone()) == "UTC"
     monkeypatch.setenv("TIMEZONE", "")
     assert configured_timezone() is not None        # the machine's own zone, or UTC
+
+
+# ---- guardrails ---------------------------------------------------------------------
+
+from calorie_bot.bot import free_reply  # noqa: E402
+
+
+@pytest.mark.parametrize("text,reply", [
+    ("hi", "Hi!"), ("Good morning!", "Hi!"), ("thanks!!", "👍"), ("ok", "👍"),
+    ("👍🔥", "👍"), ("...", "👍"), ("", ""),
+    ("2 eggs", None), ("hi, I had 2 eggs", None), ("thanks, also a banana", None),
+])
+def test_free_reply(text, reply):
+    out = free_reply(text, has_photo=False)
+    assert (out is None) if reply is None else out.startswith(reply)
+
+
+def test_photo_always_goes_to_claude():
+    assert free_reply("", has_photo=True) is None
+
+
+def test_long_message_refused(monkeypatch):
+    monkeypatch.setenv("MAX_MESSAGE_CHARS", "50")
+    assert "too long" in free_reply("x" * 51, has_photo=False)
+    assert free_reply("x" * 50, has_photo=False) is None
+
+
+def test_free_replies_and_cap_skip_claude(tmp_path, monkeypatch):
+    monkeypatch.setenv("CLAUDE_DAILY_LIMIT", "2")
+    chat = Chat(tmp_path)
+    assert chat.say("hi").startswith("Hi!") and chat.say("thanks") == "👍"
+    chat.say("an apple", claude_says("other", note="ok"))
+    chat.say("a pear", claude_says("other", note="ok"))
+    assert "today's limit of 2" in chat.say("a plum")
+    assert len(chat.claude.calls) == 2                    # greetings, thanks and the 3rd call: free
+    assert "Nothing logged" in chat.say("today")           # instant replies still work
+
+
+def test_claude_usage_counts_per_user_per_day(tmp_path):
+    s = Store(tmp_path / "t.db", TZ)
+    assert [s.count_claude_call(1) for _ in range(3)] == [1, 2, 3]
+    assert s.count_claude_call(2) == 1
+
+
+def test_claude_code_runs_at_low_effort(fake_claude):
+    _, calls = fake_claude({"is_error": False, "structured_output": {"items": [], "note": ""}}, text="x")
+    assert "--effort low" in calls

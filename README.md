@@ -68,6 +68,18 @@ Claude can run two ways (you pick during setup):
 | Speed | 5–10 s per message | A few seconds faster |
 | Pi needed | 4 GB RAM or more (Claude Code's requirement) | Any Pi that runs Python 3.9+ |
 
+### Guardrails against wasted usage
+- **Free replies:** greetings ("hi"), thanks and "ok", emoji, and the instant phrases
+  ("today", "undo", "help", …) are answered without calling Claude.
+- **Stays on topic:** Claude handles food, nutrition, recipes and your log only.
+  Anything else (coding, trivia, homework, "ignore your instructions…") gets a one-line
+  "I only help with food and nutrition" reply. A short nutrition question gets a
+  one-sentence answer.
+- **Daily cap:** each person gets 100 Claude calls a day by default (`CLAUDE_DAILY_LIMIT`),
+  so a runaway chat can't use up your plan. Instant replies keep working past the cap.
+- **Small calls:** messages over 3,000 characters are refused (`MAX_MESSAGE_CHARS`), and
+  Claude runs at low effort (`ESTIMATE_EFFORT`), which is plenty for food estimates.
+
 > Claude subscriptions are for one person's use. If several people will use your bot,
 > consider the API option.
 
@@ -192,6 +204,9 @@ to the Pi and runs the update there. The Pi keeps its own `.env` and `data/`.
 | `TIMEZONE` | e.g. `America/New_York`; decides when "today" starts. Empty = the Pi's own |
 | `ESTIMATOR` | `claude-code` (subscription) or `api` (needs `ANTHROPIC_API_KEY`) |
 | `CLAUDE_MODEL` | Optional model for Claude Code, e.g. `opus` |
+| `ESTIMATE_EFFORT` | How hard Claude Code thinks: `low` (default), `medium`, `high` |
+| `CLAUDE_DAILY_LIMIT` | Claude calls per person per day, default `100`; `0` = no limit |
+| `MAX_MESSAGE_CHARS` | Longest message the bot accepts, default `3000` |
 | `CLAUDE_CODE_OAUTH_TOKEN` | Optional: a token from `claude setup-token` if the Pi's login expires |
 | `HEALTH_PORT` | Apple Health sync port, default `8787`; `0` turns it off |
 | `HEALTH_BASE_URL` | What the Health links point at; default `http://<hostname>.local:8787` |
