@@ -27,6 +27,7 @@ from .db import MEALS, Entry, Recipe, Store, meal_for_time
 from .health import pending_days, start_server, sync_link
 from .nutrition import EstimateError, make_estimator
 from . import reminders, summary
+from . import targets as tgt
 
 log = logging.getLogger("calorie_bot")
 
@@ -39,7 +40,10 @@ Just talk to me. Some things you can say:
    · <i>how did I do this week?</i>
 ✏️ <i>actually it was 2 eggs, not 3</i> · <i>remove the toast</i> · <i>the arugula was dinner</i>
    · <i>undo</i>
-🎯 <i>set my goal to 2000</i> · <i>what's my goal?</i>
+🎯 <i>I want to lose weight</i>, then tell me your age, height, weight and activity, and I'll
+   work out your calories and macros · <i>my targets</i> · <i>set my goal to 2000</i>
+💬 <i>be tough on me</i> · <i>be encouraging</i> · <i>no coaching</i> (comments on your meals)
+⚖️ <i>I weigh 82 kg today</i>
 ❤️ <i>set up Apple Health</i> (sends each finished day to the Health app)
 📊 <i>summary</i> (a chart of your last 7 days; one also comes every Sunday)
 ⏰ <i>remind me about lunch at 1pm</i> · <i>no breakfast reminders</i> · <i>I skipped lunch</i>
@@ -123,6 +127,14 @@ def day_text(store: Store, user_id: int, offset: int = 0, meal: str = "") -> str
     lines.append("")
     if offset == 0:
         lines.append(day_summary(store, user_id))
+        macros = store.get_macro_targets(user_id)
+        if macros:
+            p = sum(e.protein_g for e in entries)
+            c = sum(e.carbs_g for e in entries)
+            f = sum(e.fat_g for e in entries)
+            lines.append(f"P {p:.0f}/{macros['protein_g']}g · C {c:.0f}/{macros['carbs_g']}g · "
+                         f"F {f:.0f}/{macros['fat_g']}g")
+            return "\n".join(lines)
     else:
         lines.append(f"<b>Total:</b> {fmt_kcal(sum(e.calories for e in entries))} kcal")
     lines.append(macro_line(entries))
@@ -201,6 +213,7 @@ QUICK = {
              "give summary", "give me a summary", "give me summary", "weekly summary",
              "week summary", "show summary", "graph", "chart", "show my graph"},
     "weekly_settings": {"weekly summary settings"},
+    "profile": {"targets", "my targets", "profile", "my profile", "my plan", "my macros"},
     "undo": {"undo", "undo that", "undo last", "scratch that"},
     "help": {"help", "start", "what can you do", "how does this work", "commands", "menu"},
     "recipes": {"recipes", "my recipes", "list recipes", "show recipes", "show my recipes"},
@@ -312,7 +325,7 @@ async def claude_reply(update, ctx, msg, store: Store, user_id: int, text: str,
             text=text or None, image=image,
             recipe_names=[recipe_label(r) for r in store.list_recipes(user_id)],
             history=history, today_log=today_log_for_claude(store, user_id),
-            now=f"{datetime.now(store.tz):%A %H:%M}")
+            now=f"{datetime.now(store.tz):%A %H:%M}", coaching=coaching_context(store, user_id))
     except EstimateError as e:
         await msg.reply_text(f"⚠️ {e}")
         return
@@ -366,9 +379,14 @@ async def claude_reply(update, ctx, msg, store: Store, user_id: int, text: str,
                                   (result.get("reminder_time") or "").strip().lower())
     elif intent == "skip_meal":
         await skip_meal_reply(msg, store, user_id, meal)
+    elif intent == "update_profile":
+        await update_profile_reply(msg, store, user_id, result.get("profile") or {})
+    elif intent == "show_profile":
+        await show_profile_reply(msg, store, user_id)
     elif intent in ("log_meal", "correct_log") and result.get("items"):
         await log_items_reply(msg, store, user_id, result["items"], note, text or "photo",
-                              replace_ids=entry_ids if intent == "correct_log" else [], meal=meal)
+                              replace_ids=entry_ids if intent == "correct_log" else [], meal=meal,
+                              coach=(result.get("coach") or "").strip())
     else:
         await msg.reply_text(note or "I couldn't find any food in that. Try e.g. "
                              "“a turkey sandwich and an apple”, or ask me for help.")
@@ -401,8 +419,9 @@ def apply_recipes(store: Store, user_id: int,
 
 async def log_items_reply(msg, store: Store, user_id: int, items: list[dict], note: str,
                           description: str, replace_ids: list[int] | None = None,
-                          meal: str = "") -> None:
+                          meal: str = "", coach: str = "") -> None:
     items, from_recipe, warnings = apply_recipes(store, user_id, items)
+    was_complete = day_complete(store, user_id)
 
     replaced: list[Entry] = []
     for entry_id in replace_ids or []:
@@ -432,8 +451,124 @@ async def log_items_reply(msg, store: Store, user_id: int, items: list[dict], no
     if note:
         lines.append(f"<i>{html.escape(note)}</i>")
     lines += [f"⚠️ {html.escape(w)}" for w in warnings]
+    if coach and coaching_on(store, user_id):
+        lines += ["", f"💬 {html.escape(coach)}"]
     lines += ["", day_summary(store, user_id)]
+    if not was_complete and day_complete(store, user_id):
+        lines += ["", day_verdict(store, user_id)]
     await msg.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
+
+
+def day_complete(store: Store, user_id: int) -> bool:
+    """Breakfast, lunch and dinner each logged or skipped today."""
+    return not summary.missing_meals(store, user_id, store.today())
+
+
+def day_verdict(store: Store, user_id: int) -> str:
+    """The end-of-day line: did today land on target?"""
+    entries = store.entries_for_day(user_id, store.today())
+    total = sum(e.calories for e in entries)
+    goal = store.get_goal(user_id)
+    if not goal:
+        return f"🏁 <b>Day complete:</b> {fmt_kcal(total)} kcal."
+    diff = total - goal
+    if total < 0.75 * goal:
+        verdict = (f"⚠️ {fmt_kcal(-diff)} under target. That's a lot under: eating too little "
+                   "slows progress and costs muscle, so aim closer to your target")
+    elif diff <= 0:
+        verdict = f"✅ on target, {fmt_kcal(-diff)} under" if diff < 0 else "✅ exactly on target"
+    else:
+        verdict = f"❌ over target by {fmt_kcal(diff)}"
+    line = f"🏁 <b>Day complete:</b> {fmt_kcal(total)} / {fmt_kcal(goal)} kcal, {verdict}."
+    macros = store.get_macro_targets(user_id)
+    if macros.get("protein_g"):
+        protein = sum(e.protein_g for e in entries)
+        mark = "✅" if protein >= 0.9 * macros["protein_g"] else "⚠️"
+        line += f"\n{mark} Protein {protein:.0f} / {macros['protein_g']} g"
+    return line
+
+
+def coaching_on(store: Store, user_id: int) -> bool:
+    profile = store.get_profile(user_id)
+    return bool(store.get_goal(user_id)) and (profile.get("coach_tone") or "encouraging") != "off" \
+        and bool(profile)
+
+
+def coaching_context(store: Store, user_id: int) -> str | None:
+    """What Claude needs to comment on a meal: tone, goal, target, eaten so far."""
+    if not coaching_on(store, user_id):
+        return None
+    profile = store.get_profile(user_id)
+    goal = store.get_goal(user_id)
+    macros = store.get_macro_targets(user_id)
+    entries = store.entries_for_day(user_id, store.today())
+    eaten = sum(e.calories for e in entries)
+    protein = sum(e.protein_g for e in entries)
+    plan = {"lose": "lose weight", "gain": "gain weight", "maintain": "maintain weight"}.get(
+        profile.get("goal", ""), "track calories")
+    parts = [f"tone={profile.get('coach_tone') or 'encouraging'}", f"goal: {plan}",
+             f"daily target {goal} kcal"]
+    if macros:
+        parts.append(f"protein target {macros.get('protein_g')} g")
+    parts.append(f"eaten today before this message: {eaten} kcal, protein {protein:.0f} g")
+    return "; ".join(parts)
+
+
+def missing_profile_text(missing: list[str]) -> str:
+    asks = [tgt.FIELD_PROMPTS[f] for f in missing]
+    listed = asks[0] if len(asks) == 1 else ", ".join(asks[:-1]) + " and " + asks[-1]
+    return (f"To work out your calories and macros I still need {listed}. You can send it all "
+            "in one message, e.g. “34, male, 180 cm, 85 kg, desk job, gym 3 times a week”. "
+            "Sex is optional but makes the estimate more accurate.")
+
+
+def apply_targets(store: Store, user_id: int, profile: dict) -> tgt.Targets:
+    t = tgt.calculate(profile)
+    store.set_goal(user_id, t.calories)
+    store.set_macro_targets(user_id, {"protein_g": t.protein_g, "carbs_g": t.carbs_g,
+                                      "fat_g": t.fat_g})
+    return t
+
+
+async def update_profile_reply(msg, store: Store, user_id: int, changes: dict) -> None:
+    changes = {k: v for k, v in changes.items() if v not in (None, "", 0, 0.0)}
+    if not changes:
+        await show_profile_reply(msg, store, user_id)
+        return
+    if changes.get("weight_kg"):
+        store.log_weight(user_id, float(changes["weight_kg"]))
+    profile = store.update_profile(user_id, changes)
+    missing = tgt.missing_fields(profile)
+
+    if set(changes) == {"coach_tone"}:
+        tone = changes["coach_tone"]
+        text = {"tough": "💬 Tough love it is. I'll be blunt about your meals.",
+                "encouraging": "💬 Got it, I'll keep it encouraging.",
+                "off": "💬 Okay, no more comments on your meals."}[tone]
+        if tone != "off" and missing:
+            text += "\n\n" + missing_profile_text(missing)
+        await msg.reply_text(text)
+        return
+    if missing:
+        await msg.reply_text("Got it. " + missing_profile_text(missing))
+        return
+    t = apply_targets(store, user_id, profile)
+    head = ""
+    if changes.get("weight_kg") and len(changes) == 1:
+        head = f"⚖️ Logged {float(changes['weight_kg']):g} kg and updated your targets.\n\n"
+    await msg.reply_text(head + tgt.profile_card(profile, t), parse_mode=ParseMode.HTML)
+
+
+async def show_profile_reply(msg, store: Store, user_id: int) -> None:
+    profile = store.get_profile(user_id)
+    missing = tgt.missing_fields(profile)
+    if missing:
+        intro = ("I can work out your daily calories and macros. Tell me your goal (lose, "
+                 "maintain or gain weight) and a bit about yourself.\n\n") if not profile else ""
+        await msg.reply_text(intro + missing_profile_text(missing))
+        return
+    await msg.reply_text(tgt.profile_card(profile, tgt.calculate(profile)),
+                         parse_mode=ParseMode.HTML)
 
 
 async def move_entries_reply(msg, store: Store, user_id: int, entry_ids: list[int],
@@ -537,9 +672,13 @@ async def skip_meal_reply(msg, store: Store, user_id: int, meal: str) -> None:
     if meal not in MEALS:
         await msg.reply_text("Which meal did you skip?")
         return
+    was_complete = day_complete(store, user_id)
     store.mark_reminder(user_id, store.today(), meal, "skipped")
     where = "snacks" if meal == "snack" else meal
-    await msg.reply_text(f"Okay, no {where} today. I won't remind you about it.")
+    text = f"Okay, no {where} today. I won't remind you about it."
+    if not was_complete and day_complete(store, user_id):
+        text += "\n\n" + day_verdict(store, user_id)
+    await msg.reply_text(text, parse_mode=ParseMode.HTML)
 
 
 def health_port() -> int:
@@ -795,7 +934,8 @@ async def delete_recipe_reply(msg, store: Store, user_id: int, name: str) -> Non
 
 QUICK_REPLIES = {"today": today_reply, "week": week_reply, "undo": undo_reply,
                  "help": help_reply, "recipes": recipes_reply, "health": health_reply,
-                 "reminders": reminders_reply, "weekly_settings": weekly_settings_reply}
+                 "reminders": reminders_reply, "weekly_settings": weekly_settings_reply,
+                 "profile": show_profile_reply}
 
 
 # ---- access and errors ------------------------------------------------------

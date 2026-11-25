@@ -49,7 +49,16 @@ CREATE TABLE IF NOT EXISTS settings (
     user_id      INTEGER PRIMARY KEY,
     daily_goal   INTEGER,
     health_token TEXT,                     -- secret in the user's Apple Health sync link
-    reminders    TEXT                      -- JSON {"breakfast": "10:30" | null, ...}; NULL = defaults
+    reminders    TEXT,                     -- JSON {"breakfast": "10:30" | null, ...}; NULL = defaults
+    profile      TEXT,                     -- JSON: age, sex, height_cm, weight_kg, activity, goal, ...
+    macro_targets TEXT                     -- JSON {"protein_g": .., "carbs_g": .., "fat_g": ..}
+);
+
+CREATE TABLE IF NOT EXISTS weights (
+    user_id   INTEGER NOT NULL,
+    day       TEXT    NOT NULL,            -- YYYY-MM-DD; one weigh-in per day, the latest wins
+    weight_kg REAL    NOT NULL,
+    PRIMARY KEY (user_id, day)
 );
 
 CREATE TABLE IF NOT EXISTS reminders_done (  -- one reminder per meal per day, at most
@@ -184,8 +193,9 @@ class Store:
         settings_cols = {r["name"] for r in self.conn.execute("PRAGMA table_info(settings)")}
         if "health_token" not in settings_cols:
             self.conn.execute("ALTER TABLE settings ADD COLUMN health_token TEXT")
-        if "reminders" not in settings_cols:
-            self.conn.execute("ALTER TABLE settings ADD COLUMN reminders TEXT")
+        for col in ("reminders", "profile", "macro_targets"):
+            if col not in settings_cols:
+                self.conn.execute(f"ALTER TABLE settings ADD COLUMN {col} TEXT")
         recipe_cols = {r["name"] for r in self.conn.execute("PRAGMA table_info(recipes)")}
         if "raw_weight_g" not in recipe_cols:
             self.conn.execute("ALTER TABLE recipes ADD COLUMN raw_weight_g REAL NOT NULL DEFAULT 0")
@@ -350,6 +360,49 @@ class Store:
         self.conn.commit()
         return self.conn.execute("SELECT calls FROM claude_usage WHERE user_id=? AND day=?",
                                  (user_id, day)).fetchone()["calls"]
+
+    # ---- profile, targets and weight -----------------------------------------
+
+    def _settings_json(self, user_id: int, column: str) -> dict:
+        row = self.conn.execute(f"SELECT {column} FROM settings WHERE user_id=?",
+                                (user_id,)).fetchone()
+        return json.loads(row[column]) if row and row[column] else {}
+
+    def _set_settings_json(self, user_id: int, column: str, value: dict) -> None:
+        self.conn.execute(
+            f"INSERT INTO settings (user_id, {column}) VALUES (?, ?)"
+            f" ON CONFLICT(user_id) DO UPDATE SET {column}=excluded.{column}",
+            (user_id, json.dumps(value)))
+        self.conn.commit()
+
+    def get_profile(self, user_id: int) -> dict:
+        return self._settings_json(user_id, "profile")
+
+    def update_profile(self, user_id: int, changes: dict) -> dict:
+        """Merge in the given fields (empty values are ignored); returns the whole profile."""
+        profile = self.get_profile(user_id)
+        profile.update({k: v for k, v in changes.items() if v not in (None, "", 0, 0.0)})
+        self._set_settings_json(user_id, "profile", profile)
+        return profile
+
+    def get_macro_targets(self, user_id: int) -> dict:
+        return self._settings_json(user_id, "macro_targets")
+
+    def set_macro_targets(self, user_id: int, targets: dict) -> None:
+        self._set_settings_json(user_id, "macro_targets", targets)
+
+    def log_weight(self, user_id: int, weight_kg: float, day: date | None = None) -> None:
+        self.conn.execute(
+            "INSERT INTO weights (user_id, day, weight_kg) VALUES (?, ?, ?)"
+            " ON CONFLICT(user_id, day) DO UPDATE SET weight_kg=excluded.weight_kg",
+            (user_id, (day or self.today()).isoformat(), weight_kg))
+        self.conn.commit()
+
+    def weights_between(self, user_id: int, start: date, end: date) -> list[tuple[date, float]]:
+        rows = self.conn.execute(
+            "SELECT day, weight_kg FROM weights WHERE user_id=? AND day BETWEEN ? AND ?"
+            " ORDER BY day", (user_id, start.isoformat(), end.isoformat())).fetchall()
+        return [(date.fromisoformat(r["day"]), r["weight_kg"]) for r in rows]
 
     # ---- meal reminders ------------------------------------------------------
 

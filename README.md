@@ -34,6 +34,12 @@ There are no commands to learn. Everything is a normal message.
 - **Fixes and questions in plain words:** *"remove the toast"*, *"the salad was dinner"*,
   *"undo"*, *"how am I doing today?"*, *"how did I do this week?"*,
   *"set my goal to 1800"*.
+- **Your targets, worked out by talking:** say *"I want to lose weight"* and answer a few
+  questions in plain words (pounds and feet are fine). The bot works out your daily
+  calories and macros with the Mifflin-St Jeor formula, which most online calculators
+  use, and shows how it got there.
+- **Coaching on every meal**, encouraging or tough love, plus an end-of-day verdict:
+  on target, over, or too far under.
 - **Recipes:** save something you cook once, then log *"150g of the chili"*, *"1 serving"*
   or *"half the batch"*. Portions are worked out from the saved recipe, not re-estimated.
   It also handles **raw vs cooked weight**: you weigh chicken raw when you cook but
@@ -142,7 +148,11 @@ then run `systemctl --user restart calorie-bot`.
 | Fix an entry | *"actually it was 2 eggs, not 3"*, *"the rice was 150g"* |
 | Move to another meal | *"the salad was actually dinner"* |
 | Remove an entry | *"remove the toast"*, *"undo"* |
-| Set a goal | *"set my goal to 2000"*, *"what's my goal?"*, *"no more goal"* |
+| Work out targets | *"I want to lose weight"*, then age, height, weight and activity in any order |
+| See targets | *"my targets"*, *"how much should I eat?"* |
+| Log weight | *"I weigh 83 kg today"* (also updates your targets) |
+| Coaching tone | *"be tough on me"*, *"be encouraging"*, *"no coaching"* |
+| Set a goal by hand | *"set my goal to 2000"*, *"what's my goal?"*, *"no more goal"* |
 | See the week (chart) | *"summary"*, *"/summary"*, *"how did I do this week?"* |
 | Weekly summary | *"send my weekly summary at 6pm"*, *"turn off the weekly summary"* |
 | Save a recipe | *"save this as my chili:"* followed by the ingredients |
@@ -175,6 +185,42 @@ Dijon chicken: 879 kcal, 706 g raw → about 545 g cooked (estimated)
 ```
 For exact numbers, weigh the finished dish once: *"the dijon chicken weighed 520 g after
 cooking"*. Say *"100g raw …"* to log a raw weight instead.
+
+### Targets and coaching
+Tell the bot your goal and a little about yourself, over as many messages as you like.
+It remembers what you've said and asks only for what's still missing:
+
+```
+You:  I want to lose weight
+Bot:  To work out your calories and macros I still need your age, your height, ...
+You:  im 34, male, 5 foot 11, 190 lbs
+Bot:  ... I still need how active you are
+You:  desk job but I lift 4 days a week. can I lose 2kg a week?
+Bot:  🎯 Your targets
+      2,120 kcal a day · protein 155 g · carbs 231 g · fat 64 g
+      Plan: lose about 0.64 kg a week
+      BMR (Mifflin-St Jeor): 1,824 kcal · TDEE (× activity): 2,827 kcal
+      ⚠️ I capped the pace at 0.9 kg a week; faster loss is hard to sustain ...
+```
+
+The calculation is done in code, not by Claude, so it's exact and repeatable:
+- **BMR (Mifflin-St Jeor):** 10 × kg + 6.25 × cm − 5 × age, then +5 for men or −161 for women.
+- **TDEE:** BMR times an activity factor from 1.2 (sedentary) to 1.9 (very active).
+- **Weight change:** about 7,700 kcal per kg. Losing 0.5 kg a week is about 550 kcal a day
+  under TDEE.
+- **Macros:** protein 1.6–1.8 g per kg, fat 27% of calories, carbs the rest.
+
+**Safety limits:** the bot caps weight loss at 1 kg (or 1% of body weight) a week and 1,000
+kcal a day, never sets calories below 1,500 (men) or 1,200 (women), and won't plan weight
+loss for anyone under 18 or with a BMI under 18.5. These are estimates for healthy adults,
+not medical advice.
+
+The result becomes your daily goal. After each meal you get a sentence or two of
+coaching in the tone you picked. **Encouraging** notices what went well. **Tough** is blunt
+about poor choices and overeating, but it's about the food, never your body, and it never
+tells you to skip meals or eat below your target. When breakfast, lunch and dinner are all
+in, you get the day's verdict: on target, over, or more than 25% under, which gets a nudge
+to eat enough. "I weigh 83 kg today" logs your weight and updates your targets.
 
 ### 7-day summary chart
 *"Summary"* (or `/summary`, *"show my graph"*, *"how did I do this week?"*) sends a line
@@ -273,6 +319,7 @@ python3 -m venv .venv && .venv/bin/pip install -r requirements.txt pytest
   throwaway folder with no tools for text, and with only the Read tool for a photo.
 - `calorie_bot/db.py`: SQLite storage, with upgrades for older databases on startup.
 - `calorie_bot/reminders.py`: the once-a-minute check for meal reminders and the Sunday summary.
+- `calorie_bot/targets.py`: the calorie and macro calculation and its safety limits.
 - `calorie_bot/summary.py`: the 7-day summary and its matplotlib chart.
 - `calorie_bot/health.py`: the Apple Health sync endpoint (standard-library web server).
 

@@ -1027,3 +1027,102 @@ def test_weekly_summary_settings(tmp_path, monkeypatch):
     assert chat.store.get_reminders(1, rem.default_reminders())["lunch"] == "13:00"  # kept
     monkeypatch.setenv("WEEKLY_SUMMARY", "off")
     assert rem.default_weekly() is None
+
+
+# ---- weight goals, targets and coaching --------------------------------------------
+
+from calorie_bot import targets as tg  # noqa: E402
+
+ME = {"age": 34, "sex": "male", "height_cm": 180, "weight_kg": 85, "activity": "moderate",
+      "goal": "lose"}
+
+
+def test_targets_match_hand_calculation():
+    t = tg.calculate(ME)
+    assert t.bmr == 10 * 85 + 6.25 * 180 - 5 * 34 + 5 == 1810          # Mifflin-St Jeor
+    assert round(t.tdee, 1) == round(1810 * 1.55, 1)
+    assert t.calories == 2260                                          # 2805.5 - 550, to 10s
+    assert (t.protein_g, t.fat_g, t.carbs_g) == (153, 68, 259)
+    assert round(t.rate_kg_week, 2) == -0.5 and t.notes == []
+    assert tg.calculate({**ME, "goal": "maintain"}).calories == 2810
+    assert tg.calculate({**ME, "goal": "gain"}).calories == 3080          # +275 (0.25 kg/wk)
+
+
+def test_targets_safety_limits():
+    fast = tg.calculate({**ME, "rate_kg_week": 2})
+    assert fast.rate_kg_week >= -0.85 and any("capped" in n for n in fast.notes)
+    small = tg.calculate({"age": 60, "sex": "female", "height_cm": 150, "weight_kg": 55,
+                          "activity": "sedentary", "goal": "lose", "rate_kg_week": 1})
+    assert small.calories == 1200 and any("minimum" in n for n in small.notes)
+    thin = tg.calculate({**ME, "weight_kg": 55})                      # BMI 17
+    assert thin.rate_kg_week == 0 and any("won't plan weight loss" in n for n in thin.notes)
+    teen = tg.calculate({**ME, "age": 16})
+    assert teen.rate_kg_week == 0 and "under 18" in teen.notes[0]
+    assert tg.calculate({**ME, "goal": "gain", "rate_kg_week": 3}).calories == 2810 + 500 - 5 + 5
+    no_sex = tg.calculate({**ME, "sex": ""})
+    assert no_sex.bmr == 1810 - 5 - 78
+
+
+def test_profile_conversation(tmp_path):
+    chat = Chat(tmp_path)
+    p = lambda **kw: {"sex": "", "age": 0, "height_cm": 0, "weight_kg": 0, "activity": "",
+                      "goal": "", "rate_kg_week": 0, "target_weight_kg": 0, "coach_tone": "", **kw}
+    reply = chat.say("I want to lose weight", claude_says("update_profile", profile=p(goal="lose")))
+    assert "still need your age, your height, your current weight and how active" in reply
+    reply = chat.say("34 male 180cm 85kg", claude_says("update_profile", profile=p(
+        age=34, sex="male", height_cm=180, weight_kg=85)))
+    assert "still need how active you are" in reply
+    reply = chat.say("gym 4x a week", claude_says("update_profile", profile=p(activity="moderate")))
+    assert "2,260 kcal</b> a day" in reply and "Mifflin-St Jeor" in reply
+    assert chat.store.get_goal(1) == 2260
+    assert chat.store.get_macro_targets(1) == {"protein_g": 153, "carbs_g": 259, "fat_g": 68}
+    assert "2,260 kcal" in chat.say("my targets")                         # instant
+    reply = chat.say("I weigh 83 kg today", claude_says("update_profile", profile=p(weight_kg=83)))
+    assert "Logged 83 kg" in reply and chat.store.get_goal(1) < 2260
+    assert chat.store.weights_between(1, chat.store.today(), chat.store.today())[0][1] == 83
+    assert "Tough love" in chat.say("be harsh", claude_says("update_profile", profile=p(coach_tone="tough")))
+
+
+def test_coaching_and_day_verdict(tmp_path):
+    chat = Chat(tmp_path)
+    chat.store.update_profile(1, {**ME, "coach_tone": "tough"})
+    apply = __import__("calorie_bot.bot", fromlist=["apply_targets"]).apply_targets
+    apply(chat.store, 1, chat.store.get_profile(1))                       # 2,260 kcal
+    for meal, kcal in (("breakfast", 500), ("lunch", 700)):
+        chat.say(meal, claude_says("log_meal", meal=meal, items=[food(meal, kcal)],
+                                   coach="Fine." if meal == "breakfast" else ""))
+    ctx_line = chat.claude.calls[-1]["coaching"]
+    assert "tone=tough" in ctx_line and "eaten today before this message: 500 kcal" in ctx_line
+    assert "💬 Fine." in chat.replies[0] and "Day complete" not in chat.replies[-1]
+    reply = chat.say("pizza", claude_says("log_meal", meal="dinner", items=[food("pizza", 1300)],
+                                          coach="That pizza blew your day. Plan dinner next time."))
+    assert "💬 That pizza blew your day" in reply
+    assert "Day complete:</b> 2,500 / 2,260 kcal, ❌ over target by 240" in reply
+    assert "Protein" in reply
+
+
+def test_no_coaching_without_profile_or_when_off(tmp_path):
+    chat = Chat(tmp_path)
+    chat.say("eggs", claude_says("log_meal", meal="breakfast", items=[food("eggs", 200)], coach="Nice!"))
+    assert chat.claude.calls[-1]["coaching"] is None and "💬" not in chat.replies[-1]
+    chat.store.update_profile(1, {**ME, "coach_tone": "off"})
+    chat.store.set_goal(1, 2000)
+    chat.say("toast", claude_says("log_meal", meal="breakfast", items=[food("toast", 80)], coach="Hm."))
+    assert "💬" not in chat.replies[-1]
+
+
+def test_skipping_last_meal_gives_verdict(tmp_path):
+    chat = Chat(tmp_path)
+    chat.store.set_goal(1, 2000)
+    for meal in ("breakfast", "lunch"):
+        chat.say(meal, claude_says("log_meal", meal=meal, items=[food(meal, 600)]))
+    reply = chat.say("skipping dinner", claude_says("skip_meal", meal="dinner"))
+    assert "Day complete:</b> 1,200 / 2,000 kcal, ⚠️ 800 under target. That's a lot under" in reply
+
+
+def test_verdict_slightly_under_is_on_target(tmp_path):
+    from calorie_bot.bot import day_verdict
+    s = Store(tmp_path / "t.db", TZ)
+    s.set_goal(1, 2000)
+    s.add_items(1, "x", [item("food", 1850)], "a", meal="lunch")
+    assert "✅ on target, 150 under" in day_verdict(s, 1)
