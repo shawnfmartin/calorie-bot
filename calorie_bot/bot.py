@@ -26,34 +26,12 @@ from telegram.ext import Application, ContextTypes, MessageHandler, filters
 from .db import MEALS, Entry, Recipe, Store, meal_for_time
 from .health import pending_days, start_server, sync_link
 from .nutrition import EstimateError, make_estimator
+from . import help as helpdocs
 from . import reminders, summary
 from . import targets as tgt
 
 log = logging.getLogger("calorie_bot")
 
-HELP = """<b>Calorie tracker</b>
-Just talk to me. Some things you can say:
-
-🍽 <i>2 eggs and toast for breakfast</i>, or send a photo of your meal
-   (no meal named? I go by the time of day)
-📋 <i>what did I eat today?</i> · <i>what did I have for lunch?</i> · <i>dinner yesterday?</i>
-   · <i>how did I do this week?</i>
-✏️ <i>actually it was 2 eggs, not 3</i> · <i>remove the toast</i> · <i>the arugula was dinner</i>
-   · <i>undo</i>
-🎯 <i>set up my goals</i>, or just <i>I want to lose weight</i>, then tell me your age, height, weight and activity, and I'll
-   work out your calories and macros · <i>my targets</i> · <i>set my goal to 2000</i>
-💬 <i>be tough on me</i> · <i>be encouraging</i> · <i>no coaching</i> (comments on your meals)
-⚖️ <i>I weigh 82 kg today</i>
-❤️ <i>set up Apple Health</i> (sends each finished day to the Health app)
-📊 <i>summary</i> (a chart of your last 7 days; one also comes every Sunday)
-⏰ <i>remind me about lunch at 1pm</i> · <i>no breakfast reminders</i> · <i>I skipped lunch</i>
-   (I remind you once if a meal isn't logged by its time)
-
-📖 <b>Recipes</b>
-<i>save this as my vinaigrette:</i> and the ingredients (I'll make up a name if you don't give one)
-<i>it makes 4 servings</i> · <i>it weighed 1.6 kg cooked</i>
-<i>37g of the vinaigrette</i> · <i>1 serving of chili</i> · <i>half the batch</i>
-<i>show my recipes</i> · <i>rename it to Dijon vinaigrette</i> · <i>delete the chili recipe</i>"""
 
 
 # ---- formatting -------------------------------------------------------------
@@ -291,6 +269,11 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None
             return
         # Anything else: drop the pending delete and treat the message normally.
 
+    page = None if raw.photo else helpdocs.quick_help(text)
+    if page:
+        await msg.reply_text(page, parse_mode=ParseMode.HTML)
+        return
+
     quick = None if raw.photo else quick_intent(text)
     if quick:
         await QUICK_REPLIES[quick](msg, store, user_id)
@@ -370,7 +353,7 @@ async def claude_reply(update, ctx, msg, store: Store, user_id: int, text: str,
     elif intent == "delete_entries":
         await delete_entries_reply(msg, store, user_id, entry_ids)
     elif intent == "help":
-        await help_reply(msg, store, user_id)
+        await help_reply(msg, store, user_id, (result.get("help_topic") or "").strip())
     elif intent == "apple_health":
         await health_reply(msg, store, user_id)
     elif intent == "set_weekly_summary":
@@ -685,8 +668,8 @@ async def weekly_settings_reply(msg, store: Store, user_id: int, value: str = ""
     await msg.reply_text(weekly_text(store, user_id))
 
 
-async def help_reply(msg, store: Store, user_id: int) -> None:
-    await msg.reply_text(HELP, parse_mode=ParseMode.HTML)
+async def help_reply(msg, store: Store, user_id: int, topic: str = "") -> None:
+    await msg.reply_text(helpdocs.page(topic), parse_mode=ParseMode.HTML)
 
 
 def reminders_text(store: Store, user_id: int) -> str:

@@ -25,7 +25,9 @@ Bot:  🥗 Lunch — 612 kcal
          • Diet Coke — 0
 ```
 
-There are no commands to learn. Everything is a normal message.
+There are no commands to learn. Everything is a normal message. Say **"help"** in the
+chat for a guide to every feature, or "help recipes", "help goals" and so on for the
+details and setup steps of one.
 
 ## What it does
 

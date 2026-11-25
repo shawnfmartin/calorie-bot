@@ -150,7 +150,12 @@ Set `intent` to exactly one of:
   "update_profile" with just `coach_tone`. Leave everything not mentioned
   empty or 0.
 - "show_profile": the user asks for their targets, profile, plan, or how much they should eat.
-- "help": the user is asking what the bot can do or how to use it.
+- "help": the user is asking what the bot can do or how to use a feature. Set `help_topic`:
+  "logging" (logging, fixing, removing food, photos, meals), "day" (viewing today, a meal,
+  past days, the summary chart), "goals" (targets, the calculation, coaching, weight),
+  "recipes", "reminders" (meal reminders, weekly summary), "health" (Apple Health),
+  "limits" (cost, limits, privacy), or "" for a general overview. A question about food
+  itself ("how much protein in chicken?") is not help: it's "other".
 - "other": anything else. Put a one-sentence reply in `note`, at most 25 words.
 
 Scope: you only handle food, drink, calories, macros, nutrition, recipes and this user's log.
@@ -182,7 +187,7 @@ If the bot's last message reminded them about a meal ("Haven't logged dinner yet
 reply with food, it's that meal, whatever the time.
 
 Only fill the fields an intent uses. Leave the rest empty: `items` [], `entry_ids` [],
-`goal_kcal` 0, `meal` "", `day_offset` 0, `reminder_time` "", `rename_to` "", `coach` "",
+`goal_kcal` 0, `meal` "", `day_offset` 0, `reminder_time` "", `rename_to` "", `coach` "", `help_topic` "",
 `profile` with every field empty or 0, and `recipe` with an empty name, no ingredients and zeros (except
 `recipe.name` where described above).
 
@@ -252,6 +257,8 @@ MEAL_SCHEMA = {
         "reminder_time": {"type": "string"},
         "rename_to": {"type": "string"},
         "coach": {"type": "string"},
+        "help_topic": {"type": "string", "enum": ["logging", "day", "goals", "recipes",
+                                                   "reminders", "health", "limits", ""]},
         "profile": {
             "type": "object",
             "properties": {
@@ -275,7 +282,7 @@ MEAL_SCHEMA = {
         "note": {"type": "string"},
     },
     "required": ["intent", "items", "entry_ids", "goal_kcal", "meal", "day_offset",
-                 "reminder_time", "recipe", "coach", "profile",
+                 "reminder_time", "recipe", "coach", "help_topic", "profile",
                  "rename_to", "note"],
     "additionalProperties": False,
 }

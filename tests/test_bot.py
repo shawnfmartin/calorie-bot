@@ -1164,3 +1164,42 @@ def test_tone_question_until_chosen(tmp_path):
     reply = chat.say("tough love", claude_says("update_profile", profile=blank_profile(coach_tone="tough")))
     assert "Tough love it is" in reply
     assert "how should I comment" not in chat.say("my targets")       # asked only while unset
+
+
+# ---- help ----------------------------------------------------------------------------
+
+from calorie_bot import help as helpdocs  # noqa: E402
+
+
+def test_help_pages_fit_in_one_telegram_message():
+    for name, text in [("overview", helpdocs.OVERVIEW), *helpdocs.TOPICS.items()]:
+        visible = re.sub(r"<[^>]+>", "", text)
+        assert len(visible) < 4096, name
+        assert not re.search(r"(^|\s)/\w", visible), f"{name} mentions a slash command"
+
+
+def test_overview_lists_every_topic():
+    for topic in helpdocs.TOPICS:
+        assert f"help {topic}" in helpdocs.OVERVIEW
+
+
+@pytest.mark.parametrize("text,starts", [
+    ("help", "👋"), ("/help", "👋"), ("Help!", "👋"), ("/start", None),
+    ("help recipes", "📖"), ("help with recipes please", "📖"), ("/help goals", "🎯"),
+    ("help coaching", "🎯"), ("help setup", "🎯"), ("help reminders", "⏰"),
+    ("help weekly summary", "⏰"), ("help apple health", "❤️"), ("help logging", "🍽"),
+    ("help today", "📋"), ("help summary", "📋"), ("help privacy", "🔒"), ("help xyz", "👋"),
+    ("how does 100g raw chicken compare to cooked?", None),    # a food question, not help
+    ("helpful tip: 2 eggs", None),
+])
+def test_quick_help_routing(text, starts):
+    page = helpdocs.quick_help(text)
+    assert (page is None) if starts is None else page.startswith(starts)
+
+
+def test_help_in_chat(tmp_path):
+    chat = Chat(tmp_path)
+    assert chat.say("help recipes").startswith("📖") and chat.claude.calls == []
+    assert chat.say("/start").startswith("👋")
+    assert chat.say("how do reminders work?", claude_says("help", help_topic="reminders")).startswith("⏰")
+    assert chat.say("what can you do?", claude_says("help")).startswith("👋")
