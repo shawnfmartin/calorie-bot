@@ -24,6 +24,7 @@ from telegram.constants import ChatAction, ParseMode
 from telegram.ext import Application, ContextTypes, MessageHandler, filters
 
 from .db import MEALS, Entry, Recipe, Store, meal_for_time
+from .health import pending_days, start_server, sync_link
 from .nutrition import EstimateError, make_estimator
 
 log = logging.getLogger("calorie_bot")
@@ -38,6 +39,7 @@ Just talk to me. Some things you can say:
 ✏️ <i>actually it was 2 eggs, not 3</i> · <i>remove the toast</i> · <i>the arugula was dinner</i>
    · <i>undo</i>
 🎯 <i>set my goal to 2000</i> · <i>what's my goal?</i>
+❤️ <i>set up Apple Health</i> (sends each finished day to the Health app)
 
 📖 <b>Recipes</b>
 <i>save this as my vinaigrette:</i> and the ingredients (I'll make up a name if you don't give one)
@@ -207,6 +209,8 @@ QUICK = {
     "undo": {"undo", "undo that", "undo last", "scratch that"},
     "help": {"help", "start", "what can you do", "how does this work", "commands", "menu"},
     "recipes": {"recipes", "my recipes", "list recipes", "show recipes", "show my recipes"},
+    "health": {"apple health", "health", "health sync", "sync health", "set up apple health",
+               "setup apple health", "connect apple health", "sync apple health"},
 }
 YES_RE = re.compile(r"^(yes|y|yep|yeah|yup|sure|confirm|do it|delete it|ok|okay)\b", re.I)
 NO_RE = re.compile(r"^(no|n|nope|cancel|keep it|don't|dont|stop)\b", re.I)
@@ -306,6 +310,8 @@ async def claude_reply(update, ctx, msg, store: Store, user_id: int, text: str,
         await delete_entries_reply(msg, store, user_id, entry_ids)
     elif intent == "help":
         await help_reply(msg, store, user_id)
+    elif intent == "apple_health":
+        await health_reply(msg, store, user_id)
     elif intent in ("log_meal", "correct_log") and result.get("items"):
         await log_items_reply(msg, store, user_id, result["items"], note, text or "photo",
                               replace_ids=entry_ids if intent == "correct_log" else [], meal=meal)
@@ -421,6 +427,50 @@ async def week_reply(msg, store: Store, user_id: int) -> None:
 
 async def help_reply(msg, store: Store, user_id: int) -> None:
     await msg.reply_text(HELP, parse_mode=ParseMode.HTML)
+
+
+def health_port() -> int:
+    return int(os.environ.get("HEALTH_PORT", "8787"))
+
+
+async def health_reply(msg, store: Store, user_id: int) -> None:
+    if not health_port():
+        await msg.reply_text("Apple Health sync is turned off on this bot (HEALTH_PORT=0).")
+        return
+    link = sync_link(store, user_id, health_port())
+    waiting = len(pending_days(store, user_id))
+    lines = [
+        "❤️ <b>Apple Health sync</b>",
+        "A Shortcut on your iPhone copies each finished day into Health every morning: "
+        "calories, protein, carbs and fat for each meal. Today's meals go in tomorrow, so "
+        "anything you fix or undo today doesn't leave stray entries in Health.",
+        "",
+        "<b>Your personal link</b> (keep it private):",
+        f"<code>{html.escape(link)}</code>",
+        "It only works on your home Wi-Fi.",
+        "",
+        "<b>Make the Shortcut</b> (Shortcuts app → +), adding these actions in order:",
+        "1. <b>Get Contents of URL</b>: paste your link",
+        "2. <b>Get Dictionary Value</b>: Value for <code>samples</code> in Contents of URL",
+        "3. <b>Repeat with Each</b> item in Dictionary Value. Inside the repeat:",
+        "   a. <b>Get Dictionary Value</b>: <code>date</code> in Repeat Item, then "
+        "<b>Get Dates from Input</b>",
+        "   b. <b>Get Dictionary Value</b>: <code>kcal</code> in Repeat Item, then "
+        "<b>Log Health Sample</b>: Dietary Energy, value = Dictionary Value, date = Dates",
+        "   c. Same pair for <code>protein_g</code> → Protein, <code>carbs_g</code> → "
+        "Carbohydrates, <code>fat_g</code> → Total Fat",
+        "4. After End Repeat: <b>Get Dictionary Value</b>: <code>ack_url</code> in Contents "
+        "of URL, then <b>Get Contents of URL</b> with that value",
+        "",
+        "Run it once by hand so iOS asks to let Shortcuts write to Health; allow it.",
+        "",
+        "<b>Run it every morning:</b> Shortcuts → Automation → + → Time of Day, e.g. 6:00 AM, "
+        "Daily, <i>Run Immediately</i>. If your phone isn't home one morning, the next run "
+        "catches up.",
+        "",
+        f"Days waiting to sync: {waiting}." if waiting else "Nothing waiting to sync yet.",
+    ]
+    await msg.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
 
 
 async def goal_reply(msg, store: Store, user_id: int, goal: float) -> None:
@@ -626,7 +676,7 @@ async def delete_recipe_reply(msg, store: Store, user_id: int, name: str) -> Non
 
 
 QUICK_REPLIES = {"today": today_reply, "week": week_reply, "undo": undo_reply,
-                 "help": help_reply, "recipes": recipes_reply}
+                 "help": help_reply, "recipes": recipes_reply, "health": health_reply}
 
 
 # ---- access and errors ------------------------------------------------------
@@ -678,7 +728,11 @@ def main() -> None:
     logging.basicConfig(format="%(asctime)s %(levelname)s %(name)s: %(message)s",
                         level=logging.INFO)
     logging.getLogger("httpx").setLevel(logging.WARNING)  # don't log the bot token in URLs
-    build_app().run_polling(allowed_updates=Update.ALL_TYPES)
+    app = build_app()
+    if health_port():
+        store: Store = app.bot_data["store"]
+        start_server(os.environ.get("DB_PATH", "data/calories.db"), store.tz, health_port())
+    app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
 if __name__ == "__main__":

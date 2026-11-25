@@ -119,6 +119,7 @@ Set `intent` to exactly one of:
 - "list_recipes": the user wants to see all their saved recipes.
 - "delete_recipe": the user wants to delete a saved recipe. Set `recipe.name` to its exact name.
   (The bot asks them to confirm.)
+- "apple_health": the user wants to connect, sync or set up Apple Health, or asks how.
 - "help": the user is asking what the bot can do or how to use it.
 - "other": anything else (a greeting, a question, something unrelated). Put a short helpful reply
   in `note`.
@@ -165,7 +166,7 @@ _RECIPE_KEYS = list(_RECIPE_PROPS)
 
 INTENTS = ["log_meal", "correct_log", "move_entries", "delete_entries", "undo_last", "show_day",
            "show_week",
-           "set_goal", "save_recipe", "update_recipe", "rename_recipe", "show_recipe",
+           "set_goal", "apple_health", "save_recipe", "update_recipe", "rename_recipe", "show_recipe",
            "list_recipes", "delete_recipe", "help", "other"]
 
 MEAL_SCHEMA = {

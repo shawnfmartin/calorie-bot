@@ -37,6 +37,7 @@ There are no commands. Everything is a plain message:
 | Set a goal | *"set my goal to 2000"*, *"what's my goal?"*, *"no more goal"* |
 | Save a recipe | *"save this as my vinaigrette:"* and the ingredients |
 | Manage recipes | *"show my recipes"*, *"show the vinaigrette"*, *"rename it to …"*, *"delete the chili recipe"* |
+| Sync to Apple Health | *"set up Apple Health"* |
 | Get help | *"help"* |
 
 **Meals:** every entry belongs to breakfast, lunch, dinner or a snack. Say which (*"for
@@ -125,6 +126,35 @@ Dijon chicken: 879 kcal, 706 g raw → about 545 g cooked (estimated)
 - **Raw portions:** *"100g raw dijon chicken"* is measured against the raw weight instead.
 - **Uncooked recipes** (dressings, salads, smoothies) just use the raw total.
 
+## Apple Health
+
+Apple Health has no internet API, so the Pi can't write to it. Instead, a Shortcut on your
+iPhone pulls from the Pi every morning and logs each meal into Health as calories,
+protein, carbs and fat, timed at when you ate. Health's own nutrition views, including
+the redesigned Health app's, then show it. Don't also log the same food directly in
+Health, or it counts twice.
+
+Say *"set up Apple Health"* to the bot. It replies with your personal sync link and the
+Shortcut steps. Each person gets their own link, which works only on your home Wi-Fi.
+
+- **Only finished days are sent** (yesterday and earlier, up to 30 days back). A Shortcut
+  can't delete what it logged, so waiting for the day to end means fixes and undos never
+  leave stray entries in Health. Today's meals appear tomorrow.
+- **Nothing is sent twice.** After logging, the Shortcut calls the link's `ack_url`, and
+  the Pi marks those days as done. If the phone isn't home one morning, the next run
+  catches up.
+- **The link is a secret.** Anyone on your Wi-Fi who has it can read that person's daily
+  totals. Set `HEALTH_PORT=0` in `.env` to turn the sync off.
+
+What the link returns:
+
+```json
+{"samples": [{"day": "2026-11-24", "meal": "breakfast", "date": "Nov 24, 2026 at 9:42 AM",
+              "kcal": 255, "protein_g": 22.0, "carbs_g": 6.0, "fat_g": 14.0}, ...],
+ "days": ["2026-11-24"],
+ "ack_url": "http://jarvis.local:8787/health/<token>/ack?days=2026-11-24"}
+```
+
 ## Setup
 
 The code is already deployed to `~/calorie-bot` on the Pi, with its `calorie-bot` service
@@ -189,6 +219,8 @@ Anthropic API directly (`claude-opus-5-5`). That's faster but billed per token, 
   `claude -p` in a throwaway folder. The message goes in on stdin and a JSON schema comes back
   as structured output. Text runs get no tools, and photo runs may only read the photo. At
   most two estimates run at once, to spare the Pi's memory.
+- `calorie_bot/health.py`: the Apple Health sync endpoint, a small standard-library web
+  server on port 8787 that runs inside the bot's process.
 - `calorie_bot/db.py`: SQLite. One row per food item, tagged with its meal and grouped by
   the message it came from. "Today" is computed
   in your `TIMEZONE`, so a midnight snack counts toward the right day.

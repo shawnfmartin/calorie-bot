@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import secrets
 import sqlite3
 from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta
@@ -45,8 +46,16 @@ CREATE TABLE IF NOT EXISTS recipes (
 );
 
 CREATE TABLE IF NOT EXISTS settings (
-    user_id     INTEGER PRIMARY KEY,
-    daily_goal  INTEGER
+    user_id      INTEGER PRIMARY KEY,
+    daily_goal   INTEGER,
+    health_token TEXT                      -- secret in the user's Apple Health sync link
+);
+
+CREATE TABLE IF NOT EXISTS health_synced (  -- days already logged into Apple Health
+    user_id   INTEGER NOT NULL,
+    day       TEXT    NOT NULL,             -- YYYY-MM-DD, local time
+    synced_at TEXT    NOT NULL,
+    PRIMARY KEY (user_id, day)
 );
 """
 
@@ -155,6 +164,9 @@ class Store:
         columns = {r["name"] for r in self.conn.execute("PRAGMA table_info(entries)")}
         if "meal" not in columns:
             self.conn.execute("ALTER TABLE entries ADD COLUMN meal TEXT")
+        settings_cols = {r["name"] for r in self.conn.execute("PRAGMA table_info(settings)")}
+        if "health_token" not in settings_cols:
+            self.conn.execute("ALTER TABLE settings ADD COLUMN health_token TEXT")
         recipe_cols = {r["name"] for r in self.conn.execute("PRAGMA table_info(recipes)")}
         if "raw_weight_g" not in recipe_cols:
             self.conn.execute("ALTER TABLE recipes ADD COLUMN raw_weight_g REAL NOT NULL DEFAULT 0")
@@ -309,6 +321,40 @@ class Store:
         return Recipe(r["id"], r["name"], json.loads(r["ingredients"]), r["total_weight_g"],
                       r["servings"], r["calories"], r["protein_g"], r["carbs_g"], r["fat_g"],
                       r["raw_weight_g"], r["weight_basis"])
+
+    # ---- Apple Health sync ---------------------------------------------------
+
+    def health_token(self, user_id: int) -> str:
+        """The user's sync-link secret, made on first use."""
+        row = self.conn.execute("SELECT health_token FROM settings WHERE user_id=?",
+                                (user_id,)).fetchone()
+        if row and row["health_token"]:
+            return row["health_token"]
+        token = secrets.token_urlsafe(18)
+        self.conn.execute(
+            "INSERT INTO settings (user_id, health_token) VALUES (?, ?)"
+            " ON CONFLICT(user_id) DO UPDATE SET health_token=excluded.health_token",
+            (user_id, token))
+        self.conn.commit()
+        return token
+
+    def user_for_health_token(self, token: str) -> int | None:
+        if not token:
+            return None
+        row = self.conn.execute("SELECT user_id FROM settings WHERE health_token=?",
+                                (token,)).fetchone()
+        return row["user_id"] if row else None
+
+    def synced_days(self, user_id: int) -> set[date]:
+        return {date.fromisoformat(r["day"]) for r in self.conn.execute(
+            "SELECT day FROM health_synced WHERE user_id=?", (user_id,))}
+
+    def mark_synced(self, user_id: int, days: list[date]) -> None:
+        now = datetime.now(ZoneInfo("UTC")).isoformat(timespec="seconds")
+        self.conn.executemany(
+            "INSERT OR IGNORE INTO health_synced (user_id, day, synced_at) VALUES (?, ?, ?)",
+            [(user_id, d.isoformat(), now) for d in days])
+        self.conn.commit()
 
     def get_goal(self, user_id: int) -> int | None:
         row = self.conn.execute("SELECT daily_goal FROM settings WHERE user_id=?",

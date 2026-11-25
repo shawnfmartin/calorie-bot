@@ -710,3 +710,92 @@ def test_old_recipes_get_raw_weight(tmp_path):
     v, c = s.get_recipe(1, "vinaigrette"), s.get_recipe(1, "chili")
     assert (v.raw_weight_g, v.weight_basis) == (120, "raw")
     assert (c.raw_weight_g, c.total_weight_g, c.weight_basis) == (120, 60, "weighed")
+
+
+# ---- Apple Health sync ------------------------------------------------------------
+
+import urllib.request  # noqa: E402
+
+from calorie_bot import health  # noqa: E402
+
+
+def log_on(s, days_ago, meal, name, kcal, hour):
+    when = datetime.combine(s.today() - timedelta(days=days_ago), datetime.min.time(), TZ) \
+        + timedelta(hours=hour)
+    s.add_items(1, "x", [item(name, kcal)], uuid4hex(), when, meal=meal)
+
+
+def uuid4hex():
+    import uuid
+    return uuid.uuid4().hex
+
+
+def test_health_export_finished_days_by_meal(tmp_path):
+    s = Store(tmp_path / "t.db", TZ)
+    log_on(s, 2, "breakfast", "eggs", 143, 8)
+    log_on(s, 2, "breakfast", "toast", 80, 9)
+    log_on(s, 2, "dinner", "pasta", 700, 19)
+    log_on(s, 1, "lunch", "salad", 300, 12)
+    log_on(s, 0, "lunch", "today's lunch", 500, 0)      # today: never sent
+    log_on(s, 40, "lunch", "too old", 500, 12)          # beyond 30 days
+    out = health.export(s, 1, "http://pi/health/tok")
+    assert [(x["meal"], x["kcal"]) for x in out["samples"]] == [("breakfast", 223), ("dinner", 700),
+                                                                ("lunch", 300)]
+    first = out["samples"][0]
+    assert first["protein_g"] == 2 and first["iso"].endswith(("-08:00", "-07:00"))
+    assert first["date"].endswith("at 8:00 AM")                     # earliest item in the meal
+    d2, d1 = (s.today() - timedelta(days=2)).isoformat(), (s.today() - timedelta(days=1)).isoformat()
+    assert out["days"] == [d2, d1] and out["ack_url"] == f"http://pi/health/tok/ack?days={d2},{d1}"
+
+    assert health.acknowledge(s, 1, f"{d2},{s.today().isoformat()},garbage") == [d2]  # today refused
+    assert health.export(s, 1, "l")["days"] == [d1]
+    health.acknowledge(s, 1, d1)
+    assert health.export(s, 1, "l") == {"samples": [], "days": [], "ack_url": "l/ack"}
+
+
+def test_health_tokens_are_per_user(tmp_path):
+    s = Store(tmp_path / "t.db", TZ)
+    t1, t2 = s.health_token(1), s.health_token(2)
+    assert t1 != t2 and s.health_token(1) == t1 and len(t1) >= 20
+    assert s.user_for_health_token(t2) == 2 and s.user_for_health_token("nope") is None
+    s.set_goal(1, 2000)
+    assert s.health_token(1) == t1 and s.get_goal(1) == 2000          # goal and token coexist
+
+
+def test_health_http_server(tmp_path, monkeypatch):
+    path = tmp_path / "t.db"
+    s = Store(path, TZ)
+    log_on(s, 1, "dinner", "steak", 600, 19)
+    token = s.health_token(1)
+    server = health.ThreadingHTTPServer(("127.0.0.1", 0), health.make_handler(str(path), TZ, 0))
+    port = server.server_address[1]
+    monkeypatch.setenv("HEALTH_BASE_URL", f"http://127.0.0.1:{port}")
+    health.threading.Thread(target=server.serve_forever, daemon=True).start()
+    get = lambda p: json.loads(urllib.request.urlopen(f"http://127.0.0.1:{port}{p}").read())
+    try:
+        out = get(f"/health/{token}")
+        assert [x["kcal"] for x in out["samples"]] == [600]
+        assert get(urlparse_path(out["ack_url"]))["synced"] == out["days"]
+        assert get(f"/health/{token}")["samples"] == []
+        with pytest.raises(urllib.error.HTTPError) as e:
+            urllib.request.urlopen(f"http://127.0.0.1:{port}/health/wrong-token-1234567890")
+        assert e.value.code == 404
+    finally:
+        server.shutdown()
+
+
+def urlparse_path(url):
+    from urllib.parse import urlparse
+    u = urlparse(url)
+    return f"{u.path}?{u.query}"
+
+
+def test_health_setup_reply(tmp_path, monkeypatch):
+    monkeypatch.setenv("HEALTH_BASE_URL", "http://jarvis.local:8787")
+    chat = Chat(tmp_path)
+    reply = chat.say("set up apple health")                      # instant, no Claude
+    token = chat.store.health_token(1)
+    assert f"http://jarvis.local:8787/health/{token}" in reply and "Log Health Sample" in reply
+    assert chat.claude.calls == []
+    assert "Apple Health sync" in chat.say("can you sync to my iphone health app?",
+                                           claude_says("apple_health"))
