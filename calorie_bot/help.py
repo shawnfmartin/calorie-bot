@@ -12,7 +12,7 @@ Just talk to me in plain words, no commands needed. I log your food, work out ca
 macros, and keep track of your day.
 
 <b>What I can do</b> (say “help” and the topic for details):
-🍽 <b>help logging</b>: log food by text or photo, fix or remove entries
+🍽 <b>help logging</b>: log food by text, photo or barcode, fix or remove entries
 📋 <b>help day</b>: see today, a meal, yesterday, or a 7-day chart
 🎯 <b>help goals</b>: work out your calorie and macro targets, coaching, weigh-ins
 📖 <b>help recipes</b>: save recipes and log portions, raw vs cooked weight
@@ -33,6 +33,9 @@ TOPICS = {
 • <i>chipotle chicken bowl and a diet coke</i>
 • <i>150g rice, 200g chicken breast, 10g olive oil</i>
 • Send a <b>photo</b> of your plate; a caption makes it more accurate.
+• Packaged food: send a photo of the <b>barcode</b> (or type its number). I look it up in Open
+  Food Facts, show the label's numbers, and ask how much you had: <i>1 can</i>, <i>40g</i>,
+  <i>2 bars</i>, <i>half the bag</i>. Calories come straight from the label.
 
 <b>Meals</b>: say which (<i>for lunch</i>, <i>as a snack</i>), or I go by the time: before 11:00
 breakfast, 11–16 lunch, 16–22 dinner, otherwise a snack. If you answer one of my reminders,

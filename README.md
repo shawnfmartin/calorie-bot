@@ -32,6 +32,9 @@ details and setup steps of one.
 ## What it does
 
 - **Logs food from text or photos**, broken into items with calories, protein, carbs and fat.
+- **Barcode scanning:** photograph a barcode and the bot looks the product up in
+  [Open Food Facts](https://openfoodfacts.org), then asks how much you had. The calories
+  come from the label, not an estimate.
 - **Breakfast, lunch, dinner and snacks:** taken from what you say, or from the time of day.
 - **Fixes and questions in plain words:** *"remove the toast"*, *"the salad was dinner"*,
   *"undo"*, *"how am I doing today?"*, *"how did I do this week?"*,
@@ -145,6 +148,7 @@ then run `systemctl --user restart calorie-bot`.
 | To… | Say something like |
 |---|---|
 | Log food | *"2 eggs and toast for breakfast"*, or send a photo |
+| Scan packaged food | Send a photo of the barcode (or type the number), then *"1 can"*, *"40g"*, *"2 bars"* |
 | See today | *"what did I eat today?"*, *"how many calories left?"* |
 | Ask about a meal | *"what did I have for lunch?"*, *"dinner yesterday?"* |
 | Fix an entry | *"actually it was 2 eggs, not 3"*, *"the rice was 150g"* |
@@ -164,6 +168,27 @@ then run `systemctl --user restart calorie-bot`.
 
 The bot remembers your last few messages, so "it" means whatever you were just talking
 about. Deleting a recipe asks you to reply "yes" first.
+
+### Barcodes
+Send a photo of a product's barcode, or type the number. The Pi reads the barcode itself
+(with [zxing-cpp](https://github.com/zxing-cpp/zxing-cpp)) and looks the product up in
+[Open Food Facts](https://openfoodfacts.org), a free, open database of packaged food. It
+replies with the label's numbers per 100 g or ml and per serving, and asks how much you had:
+
+```
+Bot:  📦 Coca-Cola Original, 330 ml
+      Per 100 ml: 44 kcal · P 0g · C 10.9g · F 0g
+      Per serving (330 ml): 145 kcal
+      How much did you have?
+You:  1 can with lunch
+Bot:  🥗 Logged for lunch
+      • 📦 Coca-Cola Original, 330 ml — 145 kcal
+```
+
+Claude only converts your answer ("1 can", "2 tbsp", "half the bag") into grams or ml.
+The calories are computed from the label data. Lookups are cached on the Pi, so scanning
+the same product again is instant. If a product isn't in Open Food Facts, send a photo of
+its nutrition label instead.
 
 ### Recipes
 ```
@@ -326,6 +351,7 @@ python3 -m venv .venv && .venv/bin/pip install -r requirements.txt pytest
 - `calorie_bot/reminders.py`: the once-a-minute check for meal reminders and the Sunday summary.
 - `calorie_bot/targets.py`: the calorie and macro calculation and its safety limits.
 - `calorie_bot/summary.py`: the 7-day summary and its matplotlib chart.
+- `calorie_bot/barcode.py`: barcode reading and Open Food Facts lookups, with a cache.
 - `calorie_bot/health.py`: the Apple Health sync endpoint (standard-library web server).
 
 ## License

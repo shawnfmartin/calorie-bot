@@ -23,9 +23,10 @@ from telegram import Update
 from telegram.constants import ChatAction, ParseMode
 from telegram.ext import Application, ContextTypes, MessageHandler, filters
 
-from .db import MEALS, Entry, Recipe, Store, meal_for_time
+from .db import MEALS, Entry, Recipe, Store, meal_for_time, recipe_key
 from .health import pending_days, start_server, sync_link
 from .nutrition import EstimateError, make_estimator
+from . import barcode
 from . import help as helpdocs
 from . import reminders, summary
 from . import targets as tgt
@@ -205,6 +206,7 @@ QUICK = {
 YES_RE = re.compile(r"^(yes|y|yep|yeah|yup|sure|confirm|do it|delete it|ok|okay)\b", re.I)
 NO_RE = re.compile(r"^(no|n|nope|cancel|keep it|don't|dont|stop)\b", re.I)
 CONFIRM_SECONDS = 300
+SCAN_SECONDS = 30 * 60   # how long a scanned product waits for "how much?"
 
 # ---- guardrails: things that never need Claude ---------------------------------------
 GREETINGS = {"hi", "hello", "hey", "hiya", "yo", "sup", "good morning", "morning",
@@ -269,6 +271,23 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None
             return
         # Anything else: drop the pending delete and treat the message normally.
 
+    # A product scanned in the previous message, waiting for "how much did you have?"
+    scans: dict = ctx.bot_data.setdefault("scanned", {})
+    scanned = scans.pop(user_id, None)
+    product = scanned[0] if scanned and time.monotonic() - scanned[1] < SCAN_SECONDS else None
+
+    image = None
+    if raw.photo:
+        tg_file = await raw.photo[-1].get_file()
+        image = bytes(await tg_file.download_as_bytearray())
+        code = await asyncio.to_thread(barcode.decode, image)
+        if code:
+            await scan_reply(msg, store, user_id, code, scans)
+            return
+    elif barcode.barcode_in_text(text):
+        await scan_reply(msg, store, user_id, barcode.barcode_in_text(text), scans)
+        return
+
     page = None if raw.photo else helpdocs.quick_help(text)
     if page:
         await msg.reply_text(page, parse_mode=ParseMode.HTML)
@@ -279,7 +298,7 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None
         await QUICK_REPLIES[quick](msg, store, user_id)
         return
 
-    canned = free_reply(text, bool(raw.photo))
+    canned = None if product else free_reply(text, bool(raw.photo))
     if canned is not None:
         if canned:
             await msg.reply_text(canned)
@@ -293,22 +312,23 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None
                              "still work.")
         return
 
-    await claude_reply(update, ctx, msg, store, user_id, text, history)
+    await claude_reply(update, ctx, msg, store, user_id, text, history, image=image,
+                       product=product)
 
 
 async def claude_reply(update, ctx, msg, store: Store, user_id: int, text: str,
-                       history: list[str]) -> None:
+                       history: list[str], image: bytes | None = None,
+                       product: barcode.Product | None = None) -> None:
     estimator = ctx.bot_data["estimator"]
-    image = None
-    if msg.photo:
-        tg_file = await msg.photo[-1].get_file()
-        image = bytes(await tg_file.download_as_bytearray())
+    labels = [recipe_label(r) for r in store.list_recipes(user_id)]
+    if product:
+        labels.append(product.label_for_claude())
 
     typing = asyncio.create_task(keep_typing(ctx, msg.chat_id))
     try:
         result = await estimator.estimate(
             text=text or None, image=image,
-            recipe_names=[recipe_label(r) for r in store.list_recipes(user_id)],
+            recipe_names=labels,
             history=history, today_log=today_log_for_claude(store, user_id),
             now=f"{datetime.now(store.tz):%A %H:%M}", coaching=coaching_context(store, user_id))
     except EstimateError as e:
@@ -371,7 +391,7 @@ async def claude_reply(update, ctx, msg, store: Store, user_id: int, text: str,
     elif intent in ("log_meal", "correct_log") and result.get("items"):
         await log_items_reply(msg, store, user_id, result["items"], note, text or "photo",
                               replace_ids=entry_ids if intent == "correct_log" else [], meal=meal,
-                              coach=(result.get("coach") or "").strip())
+                              coach=(result.get("coach") or "").strip(), product=product)
     else:
         await msg.reply_text(note or "I couldn't find any food in that. Try e.g. "
                              "“a turkey sandwich and an apple”, or ask me for help.")
@@ -379,8 +399,8 @@ async def claude_reply(update, ctx, msg, store: Store, user_id: int, text: str,
 
 # ---- logging food -----------------------------------------------------------
 
-def apply_recipes(store: Store, user_id: int,
-                  items: list[dict]) -> tuple[list[dict], list[bool], list[str]]:
+def apply_recipes(store: Store, user_id: int, items: list[dict],
+                  product: barcode.Product | None = None) -> tuple[list[dict], list[bool], list[str]]:
     """Swap Claude's guesses for exact numbers where an item is a portion of a saved recipe.
 
     Returns (items, which ones came from a recipe, warnings for the user)."""
@@ -389,6 +409,15 @@ def apply_recipes(store: Store, user_id: int,
         name = (i.get("recipe") or "").strip()
         recipe = store.get_recipe(user_id, name) if name else None
         portion = None
+        if name and product and recipe_key(name) == recipe_key(product.title):
+            grams = i.get("recipe_grams") or 0
+            portion = product.as_recipe().portion(grams=grams) if grams > 0 else None
+            if portion:
+                portion["item"] = f"{product.title}, {grams:g} {product.unit}"
+                portion["from_scan"] = True
+            out.append(portion or i)
+            used.append(portion is not None)
+            continue
         if recipe:
             grams, servings = i.get("recipe_grams") or 0, i.get("recipe_servings") or 0
             portion = recipe.portion(grams, servings, i.get("recipe_fraction") or 0,
@@ -404,8 +433,9 @@ def apply_recipes(store: Store, user_id: int,
 
 async def log_items_reply(msg, store: Store, user_id: int, items: list[dict], note: str,
                           description: str, replace_ids: list[int] | None = None,
-                          meal: str = "", coach: str = "") -> None:
-    items, from_recipe, warnings = apply_recipes(store, user_id, items)
+                          meal: str = "", coach: str = "",
+                          product: barcode.Product | None = None) -> None:
+    items, from_recipe, warnings = apply_recipes(store, user_id, items, product)
     was_complete = day_complete(store, user_id)
 
     replaced: list[Entry] = []
@@ -429,7 +459,8 @@ async def log_items_reply(msg, store: Store, user_id: int, items: list[dict], no
     else:
         label = "as a snack" if meal == "snack" else f"for {meal}"
         lines.append(f"{MEAL_ICONS[meal]} <b>Logged {label}</b>")
-    lines += [f"• {'📖 ' if used else ''}{html.escape(i['item'])} — {fmt_kcal(i['calories'])} kcal"
+    lines += [f"• {('📦 ' if i.get('from_scan') else '📖 ') if used else ''}"
+              f"{html.escape(i['item'])} — {fmt_kcal(i['calories'])} kcal"
               for i, used in zip(items, from_recipe)]
     if len(items) > 1:
         lines.append(f"<b>Meal:</b> {fmt_kcal(sum(i['calories'] for i in items))} kcal")
@@ -597,6 +628,20 @@ async def show_profile_reply(msg, store: Store, user_id: int) -> None:
         return
     await msg.reply_text(tgt.profile_card(profile, tgt.calculate(profile)),
                          parse_mode=ParseMode.HTML)
+
+
+async def scan_reply(msg, store: Store, user_id: int, code: str, scans: dict) -> None:
+    product, reachable = await barcode.lookup(store, code)
+    if not reachable:
+        await msg.reply_text(f"I read the barcode ({code}) but couldn't reach Open Food Facts "
+                             "to look it up. Try again in a minute, or tell me what it is.")
+        return
+    if product is None:
+        await msg.reply_text(f"I couldn't find barcode {code} in Open Food Facts. Send a photo "
+                             "of the nutrition label, or just tell me what it is and how much.")
+        return
+    scans[user_id] = (product, time.monotonic())
+    await msg.reply_text(barcode.card(product), parse_mode=ParseMode.HTML)
 
 
 async def move_entries_reply(msg, store: Store, user_id: int, entry_ids: list[int],

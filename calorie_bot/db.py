@@ -76,6 +76,12 @@ CREATE TABLE IF NOT EXISTS claude_usage (   -- Claude calls per person per day, 
     PRIMARY KEY (user_id, day)
 );
 
+CREATE TABLE IF NOT EXISTS products (      -- Open Food Facts lookups, by barcode
+    barcode    TEXT PRIMARY KEY,
+    data       TEXT NOT NULL,                -- the API's JSON answer, found or not
+    fetched_at TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS health_synced (  -- days already logged into Apple Health
     user_id   INTEGER NOT NULL,
     day       TEXT    NOT NULL,             -- YYYY-MM-DD, local time
@@ -437,6 +443,28 @@ class Store:
             "INSERT INTO reminders_done (user_id, day, meal, kind) VALUES (?, ?, ?, ?)"
             " ON CONFLICT(user_id, day, meal) DO UPDATE SET kind=excluded.kind",
             (user_id, day.isoformat(), meal, kind))
+        self.conn.commit()
+
+    # ---- barcode lookups -----------------------------------------------------
+
+    def cached_product(self, barcode: str, retry_missing_after_days: int = 7) -> dict | None:
+        """The cached lookup, or None. "Not found" answers are retried after a week, since
+        products get added to Open Food Facts all the time."""
+        row = self.conn.execute("SELECT data, fetched_at FROM products WHERE barcode=?",
+                                (barcode,)).fetchone()
+        if not row:
+            return None
+        data = json.loads(row["data"])
+        age = datetime.now(ZoneInfo("UTC")) - datetime.fromisoformat(row["fetched_at"])
+        if data.get("status") != 1 and age > timedelta(days=retry_missing_after_days):
+            return None
+        return data
+
+    def cache_product(self, barcode: str, data: dict) -> None:
+        self.conn.execute(
+            "INSERT INTO products (barcode, data, fetched_at) VALUES (?, ?, ?)"
+            " ON CONFLICT(barcode) DO UPDATE SET data=excluded.data, fetched_at=excluded.fetched_at",
+            (barcode, json.dumps(data), datetime.now(ZoneInfo("UTC")).isoformat(timespec="seconds")))
         self.conn.commit()
 
     # ---- Apple Health sync ---------------------------------------------------

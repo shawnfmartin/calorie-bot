@@ -1203,3 +1203,101 @@ def test_help_in_chat(tmp_path):
     assert chat.say("/start").startswith("👋")
     assert chat.say("how do reminders work?", claude_says("help", help_topic="reminders")).startswith("⏰")
     assert chat.say("what can you do?", claude_says("help")).startswith("👋")
+
+
+# ---- barcodes ------------------------------------------------------------------------
+
+from calorie_bot import barcode as bc  # noqa: E402
+
+COKE = {"status": 1, "product": {
+    "product_name": "Coca-Cola Original Taste", "brands": "Coca-Cola, The Coca-Cola Company",
+    "quantity": "330 ml", "serving_size": "330 ml", "serving_quantity": 330, "product_quantity": 330,
+    "nutriments": {"energy-kcal_100g": 42, "proteins_100g": 0, "carbohydrates_100g": 10.6, "fat_100g": 0}}}
+BAR = {"status": 1, "product": {
+    "product_name": "Protein bar", "brands": "Acme", "quantity": "4 x 45 g",
+    "serving_size": "1 bar (45 g)", "serving_quantity": 45, "product_quantity": 180,
+    "nutriments": {"energy_100g": 1700, "proteins_100g": 33, "carbohydrates_100g": 40, "fat_100g": 15}}}
+
+
+def barcode_png(code, rotate=0):
+    import zxingcpp
+    from PIL import Image
+    img = zxingcpp.write_barcode_to_image(zxingcpp.create_barcode(code, zxingcpp.BarcodeFormat.EAN13), scale=4)
+    pil = Image.fromarray(__import__("numpy").array(img)).convert("RGB")
+    canvas = Image.new("RGB", (pil.width + 200, pil.height + 200), "white")
+    canvas.paste(pil, (100, 100))
+    buf = __import__("io").BytesIO()
+    canvas.rotate(rotate, expand=True, fillcolor="white").save(buf, "JPEG")
+    return buf.getvalue()
+
+
+def test_decode_barcode_photos():
+    assert bc.decode(barcode_png("5449000000996")) == "5449000000996"
+    assert bc.decode(barcode_png("5449000000996", rotate=90)) == "5449000000996"
+    assert bc.decode(b"not an image") is None
+
+
+def test_barcode_in_text():
+    assert bc.barcode_in_text(" 5449000000996 ") == "5449000000996"
+    assert bc.barcode_in_text("12345678") == "12345678"
+    assert bc.barcode_in_text("2 eggs") is None and bc.barcode_in_text("123456") is None
+
+
+def test_parse_products():
+    coke = bc.parse("5449000000996", COKE)
+    assert (coke.unit, coke.kcal_100, coke.serving_qty, coke.brand) == ("ml", 42, 330, "Coca-Cola")
+    bar = bc.parse("1", BAR)
+    assert bar.unit == "g" and round(bar.kcal_100) == 406                # from kJ
+    assert bc.parse("1", {"status": 0}) is None
+    assert bc.parse("1", {"status": 1, "product": {"product_name": "x", "nutriments": {}}}) is None
+    card = bc.card(coke)
+    assert "Per 100 ml: 42 kcal" in card and "Per serving (330 ml): 139 kcal" in card
+    nut = bc.parse("1", {"status": 1, "product": {**COKE["product"], "quantity": "400 g e"}})
+    assert nut.package_text == "400 g"
+    assert "How much did you have?" in card
+
+
+def test_lookup_caches(tmp_path, monkeypatch):
+    s = Store(tmp_path / "t.db", TZ)
+    calls = []
+    monkeypatch.setattr(bc, "fetch", lambda code: calls.append(code) or COKE)
+    look = lambda code: asyncio.run(bc.lookup(s, code))
+    assert look("5449000000996")[0].name == "Coca-Cola Original Taste"
+    assert look("5449000000996")[0] is not None and calls == ["5449000000996"]
+    monkeypatch.setattr(bc, "fetch", lambda code: None)                  # offline
+    assert look("111") == (None, False)
+    monkeypatch.setattr(bc, "fetch", lambda code: {"status": 0})
+    assert look("222") == (None, True)
+
+
+def test_scan_then_how_much(tmp_path, monkeypatch):
+    monkeypatch.setattr(bc, "fetch", lambda code: BAR)
+    chat = Chat(tmp_path)
+    reply = chat.say("4000000000001")                                     # typed barcode
+    assert "📦 <b>Protein bar (Acme)</b>" in reply and chat.claude.calls == []
+    title = "Protein bar (Acme)"
+    reply = chat.say("2 bars for a snack", claude_says("log_meal", meal="snack", items=[{
+        **food("protein bars", 999), "recipe": title, "recipe_grams": 90}]))
+    assert any("scanned product" in r and "1 serving = 45 g" in r
+               for r in chat.claude.calls[-1]["recipe_names"])
+    assert "📦 Protein bar (Acme), 90 g — 366 kcal" in reply                # 406.3 x 0.9
+    # The scan is used once: the next message doesn't see it.
+    chat.say("an apple", claude_says("log_meal", items=[food("apple", 95)]))
+    assert not any("scanned product" in r for r in chat.claude.calls[-1]["recipe_names"])
+
+
+def test_scan_reply_short_answer_goes_to_claude(tmp_path, monkeypatch):
+    monkeypatch.setattr(bc, "fetch", lambda code: COKE)
+    chat = Chat(tmp_path)
+    chat.say("5449000000996")
+    chat.say("ok", claude_says("log_meal", items=[{**food("coke", 1), "recipe":
+             "Coca-Cola Original Taste (Coca-Cola)", "recipe_grams": 330}]))
+    assert "139 kcal" in chat.replies[-1]                                 # "ok" wasn't swallowed
+
+
+def test_unknown_and_unreachable_barcodes(tmp_path, monkeypatch):
+    chat = Chat(tmp_path)
+    monkeypatch.setattr(bc, "fetch", lambda code: {"status": 0})
+    assert "couldn't find barcode" in chat.say("0000000000000")
+    monkeypatch.setattr(bc, "fetch", lambda code: None)
+    assert "couldn't reach Open Food Facts" in chat.say("1111111111111")

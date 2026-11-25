@@ -82,6 +82,10 @@ other two at 0:
   serving of that dish, at most the whole batch, use `recipe_grams` instead, and say so in `note`,
 - `recipe_fraction` for a share of the whole batch ("half the batch" = 0.5, "a quarter" = 0.25,
   "the whole thing" = 1).
+Items listed as "scanned product" (the user just scanned its barcode) work the same way, but
+always give the amount as `recipe_grams`, in the unit listed (grams or ml), converting what
+they said ("1 can", "2 bars", "half the bag", "a handful") with the sizes given; if a size is
+unknown, estimate it. If their reply doesn't mention the scanned product at all, ignore it.
 Still fill in your own best calorie and macro estimate for the item; the bot replaces it with
 the recipe's exact numbers. For items that are not a saved recipe, set `recipe` to "" and all
 three amounts to 0.
