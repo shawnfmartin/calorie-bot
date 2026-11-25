@@ -1,237 +1,234 @@
 # Calorie bot
 
-A private Telegram bot that tracks your daily calories. You message it what you ate
-("2 eggs, toast with butter and a latte") or send a photo. Claude splits the meal into
-items and estimates calories and macros for each, and the bot keeps a running daily total
-in SQLite. It runs 24/7 on your Raspberry Pi (`jarvis.local`).
-
-Estimates run through **Claude Code on the Pi, logged in with your Claude Max plan**, so
-there's no per-meal API bill. Meals count against your Max usage limits, the same limits
-your Claude Code use draws from. Each estimate takes about 5–10 seconds.
+A private Telegram bot that tracks your calories. Tell it what you ate in plain words, or
+send a photo, and Claude works out the calories and macros. It keeps a daily log by meal,
+remembers your recipes, and can sync each day into Apple Health. It runs on a Raspberry Pi
+at home, and your food log stays in a SQLite file on the Pi.
 
 ```
-You:  chicken burrito bowl from chipotle and a diet coke
-Bot:  🍽 Logged
-      • Chipotle chicken (4 oz) — 180 kcal
-      • Cilantro-lime white rice (4 oz) — 210 kcal
-      • ...
-      • Diet Coke, 12 oz — 0 kcal
-      Meal: 660 kcal
+You:  2 eggs and toast with butter for breakfast
+Bot:  🍳 Logged for breakfast
+      • 2 large eggs, scrambled in butter — 182 kcal
+      • 1 slice whole wheat toast with 1 tsp butter — 115 kcal
+      Meal: 297 kcal
 
-      Today: 1,420 / 2,000 kcal (580 left)
+      Today: 297 / 2,000 kcal (1,703 left)
+
+You:  actually it was 3 eggs
+Bot:  ✏️ Fixed
+      • 2 large eggs, scrambled in butter — 182 kcal   (struck through)
+      • 3 large eggs, scrambled in butter — 273 kcal
+
+You:  what did I have for lunch yesterday?
+Bot:  🥗 Lunch — 612 kcal
+         • Chicken burrito bowl — 580
+         • Diet Coke — 0
 ```
 
-## Talking to it
+There are no commands to learn. Everything is a normal message.
 
-There are no commands. Everything is a plain message:
+## What it does
+
+- **Logs food from text or photos**, broken into items with calories, protein, carbs and fat.
+- **Breakfast, lunch, dinner and snacks:** taken from what you say, or from the time of day.
+- **Fixes and questions in plain words:** *"remove the toast"*, *"the salad was dinner"*,
+  *"undo"*, *"how am I doing today?"*, *"how did I do this week?"*,
+  *"set my goal to 1800"*.
+- **Recipes:** save something you cook once, then log *"150g of the chili"*, *"1 serving"*
+  or *"half the batch"*. Portions are worked out from the saved recipe, not re-estimated.
+  It also handles **raw vs cooked weight**: you weigh chicken raw when you cook but
+  cooked on your plate, so Claude estimates the cooked weight from typical cooking
+  yields, and you can replace that with a real weighing.
+- **Apple Health sync** through an iPhone Shortcut: each finished day goes in as
+  calories, protein, carbs and fat per meal.
+- **More than one person:** each person gets their own log, recipes, goal and Health link.
+- **Private:** it answers only the Telegram accounts you allow.
+
+## How it works
+
+```
+Your phone ──Telegram──▶ Telegram's servers ◀──polls── Raspberry Pi
+                                                     ├─ bot (Python)
+                                                     ├─ SQLite: your log & recipes
+                                                     └─ Claude: calorie estimates
+```
+
+The Pi connects out to Telegram, so the bot works from anywhere and you don't need to
+open any ports. Each message goes to Claude, which works out what you meant (log food,
+fix an entry, save a recipe, …) and estimates the food. The bot then stores it and
+replies. Short messages like "today", "undo" or "help" are answered instantly, without
+Claude.
+
+Claude can run two ways (you pick during setup):
+
+| | Claude Code on the Pi | Anthropic API |
+|---|---|---|
+| Uses | Your Claude Pro or Max subscription | An API key, billed per use |
+| Cost | Nothing extra | About 1–2 cents per meal |
+| Speed | 5–10 s per message | A few seconds faster |
+| Pi needed | 4 GB RAM or more (Claude Code's requirement) | Any Pi that runs Python 3.9+ |
+
+> Claude subscriptions are for one person's use. If several people will use your bot,
+> consider the API option.
+
+## Setup
+
+You need:
+- A Raspberry Pi (or any always-on Linux machine with systemd) running Raspberry Pi OS
+  Bookworm or newer (Python 3.9+ and `git`).
+- Telegram on your phone.
+- Either a Claude Pro/Max subscription or an Anthropic API key
+  ([platform.claude.com](https://platform.claude.com)).
+
+### 1. Create the Telegram bot
+In Telegram, message **@BotFather**, send `/newbot`, pick a name and a username ending in
+`bot`, and copy the token it gives you. Treat the token like a password.
+
+### 2. (Subscription option only) Install Claude Code on the Pi
+```bash
+curl -fsSL https://claude.ai/install.sh | bash
+claude      # log in with your Claude account, then exit with /exit
+```
+On a Pi without a screen, the login shows a link to open on another device.
+
+### 3. Install the bot
+On the Pi:
+```bash
+git clone https://github.com/shawnfmartin/calorie-bot.git
+cd calorie-bot
+./install.sh
+```
+The installer:
+1. Sets up Python and its packages in `.venv`.
+2. Asks for your bot token (and checks it with Telegram), your timezone, and which way
+   to run Claude.
+3. Installs a systemd **user** service, so the bot starts at boot and restarts if it
+   crashes. It doesn't need root. If it asks you to run `sudo loginctl enable-linger …`,
+   do that once.
+4. Waits for you to **send the bot a message**, then locks the bot to your Telegram
+   account.
+
+Then say hi to your bot, or *"help"* to see what it can do.
+
+### Adding another person
+Have them message the bot. It replies with their Telegram user id. Add it to
+`ALLOWED_USER_IDS` in `.env`, comma-separated (`ALLOWED_USER_IDS=111111111,222222222`),
+then run `systemctl --user restart calorie-bot`.
+
+## Using it
 
 | To… | Say something like |
 |---|---|
 | Log food | *"2 eggs and toast for breakfast"*, or send a photo |
 | See today | *"what did I eat today?"*, *"how many calories left?"* |
-| Ask about a meal | *"what did I have for lunch today?"*, *"dinner yesterday?"* |
-| Move to another meal | *"the salad was actually dinner"* |
-| See the week | *"how did I do this week?"* |
+| Ask about a meal | *"what did I have for lunch?"*, *"dinner yesterday?"* |
 | Fix an entry | *"actually it was 2 eggs, not 3"*, *"the rice was 150g"* |
+| Move to another meal | *"the salad was actually dinner"* |
 | Remove an entry | *"remove the toast"*, *"undo"* |
 | Set a goal | *"set my goal to 2000"*, *"what's my goal?"*, *"no more goal"* |
-| Save a recipe | *"save this as my vinaigrette:"* and the ingredients |
-| Manage recipes | *"show my recipes"*, *"show the vinaigrette"*, *"rename it to …"*, *"delete the chili recipe"* |
-| Sync to Apple Health | *"set up Apple Health"* |
-| Get help | *"help"* |
+| See the week | *"how did I do this week?"* |
+| Save a recipe | *"save this as my chili:"* followed by the ingredients |
+| Manage recipes | *"show my recipes"*, *"rename it to …"*, *"delete the chili recipe"* |
+| Apple Health | *"set up Apple Health"* |
 
-**Meals:** every entry belongs to breakfast, lunch, dinner or a snack. Say which (*"for
-lunch"*, *"as a snack"*), or the bot goes by the time of day: before 11:00 breakfast, 11:00
-to 16:00 lunch, 16:00 to 22:00 dinner, otherwise a snack. "Today" is grouped by meal with a
-subtotal for each:
+The bot remembers your last few messages, so "it" means whatever you were just talking
+about. Deleting a recipe asks you to reply "yes" first.
 
+### Recipes
 ```
-🍳 Breakfast — 255 kcal
-   • 3 large eggs — 215
-   • ...
-🥗 Lunch — 44 kcal
-   • Dijon vinaigrette, 33 servings — 29
-   • 59 g arugula — 15
-
-Today: 299 kcal
+Save this as Dijon chicken, makes 4 servings:
+Chicken breast   644 g
+Dijon mustard     18 g
+Soy sauce         12 g
+Olive oil          5 g
 ```
+Claude estimates each ingredient once, and the bot saves the totals. If you don't give a
+name, it makes one up. Portions can be grams (*"100g dijon chicken"*), servings (*"1
+serving"*) or a share of the batch (*"half the batch"*).
 
-Claude reads each message and works out what you want. It sees today's log, so a fix or
-removal finds the right entry, and a fix keeps the entry's original time. The bot also
-remembers your last few messages, so "it" means whatever you were just talking about. That
-memory resets when the bot restarts. A few short phrases ("today", "undo", "help", "my
-recipes") are answered instantly, without asking Claude. A message starting with `/` out of
-habit ("/today") works the same as without it.
-
-Deleting a recipe is the one thing that asks first: the bot replies *"Delete the recipe …?
-Reply yes to delete it or no to keep it."*
-
-## Recipes
-
-Save something you make often once, then log portions of it by weight, by serving, or as a
-share of the batch:
-
-```
-Save this as Dijon vinaigrette, makes 8 servings:
-Dijon mustard            20 g
-Apple cider vinegar      30 g
-Water                    55 g
-Extra virgin olive oil    5 g
-Honey                     7 g
-```
-
-If you don't give a name, the bot makes up a short one, like "Honey dijon vinaigrette".
-A made-up name never overwrites a recipe you already have; it gets a number instead, like
-"… 2". If you give the name of a saved recipe, the bot updates that recipe and tells you
-what the old numbers were. Meals you already logged keep their old numbers.
-
-Claude estimates each ingredient once, and the bot saves the totals: 90 kcal for 120 g,
-or 0.75 kcal/g. Later, a message like *"37g of the dijon vinaigrette on my salad for
-lunch"* logs the vinaigrette at exactly 37 × 0.75 = 28 kcal, worked out from the saved
-recipe, alongside Claude's estimate for the salad. Loose names work ("my vinaigrette"), as
-do spoons and cups ("2 tbsp of my vinaigrette"), which are converted to grams. Recipe
-items are marked 📖 in the reply.
-
-You can log a portion of a recipe three ways:
-
-| You say | How it's worked out |
-|---|---|
-| *"37g of the vinaigrette"*, *"2 tbsp of my vinaigrette"* | grams ÷ the batch's total weight |
-| *"1 serving of chili"* | servings ÷ the servings the recipe makes |
-| *"half the batch of chili"*, *"a quarter of the vinaigrette"* | that share of the whole batch |
-
-- **Servings:** put `makes 6 servings` (or "serves 6", "totaling 107 servings") in the recipe when you save it, or add it later in a
-  plain message: *"the vinaigrette makes 4 servings"*. If you log "1 serving" before any
-  servings are set, Claude estimates a typical serving in grams of your recipe and says so
-  in the reply.
-- **Cooked dishes:** see below.
-- **Changing a recipe:** send it again under the same name with the new ingredients.
-
-### Raw ingredients, cooked portions
-
-You weigh ingredients raw, but you weigh your plate cooked, and cooking changes the weight
-without changing the calories. Chicken breast loses about a quarter of its weight as water,
-while rice soaks up water and roughly triples. So when you save a recipe that gets cooked,
-Claude also estimates each ingredient's cooked weight from typical cooking yields, and
-portions are measured against the cooked total:
+**Raw vs cooked weight:** ingredient amounts are taken as raw. For cooked dishes, Claude
+also estimates the cooked weight (chicken breast keeps ~75% of its weight, dry rice
+roughly triples), and portions in grams are read as cooked weight, as on your plate:
 
 ```
 Dijon chicken: 879 kcal, 706 g raw → about 545 g cooked (estimated)
-"100g dijon chicken for lunch"  →  879 × 100 / 545 = 161 kcal   (raw-based would say 124)
+"100g dijon chicken"  →  879 × 100 / 545 = 161 kcal    (a raw-based count would say 124)
 ```
+For exact numbers, weigh the finished dish once: *"the dijon chicken weighed 520 g after
+cooking"*. Say *"100g raw …"* to log a raw weight instead.
 
-- **Weigh it for exact numbers:** *"the dijon chicken weighed 520 g after cooking"*
-  replaces the estimate with your weight. You can also give it when saving: *"…weighed
-  1.8 kg cooked"*.
-- **Raw portions:** *"100g raw dijon chicken"* is measured against the raw weight instead.
-- **Uncooked recipes** (dressings, salads, smoothies) just use the raw total.
+### Apple Health
+Apple Health has no internet API, so the Pi can't write to it directly. A Shortcut on
+your iPhone pulls from the Pi instead. Say *"set up Apple Health"* and the bot replies
+with your personal link and step-by-step Shortcut instructions. The suggested automation
+runs the Shortcut whenever you open Telegram, since iOS doesn't allow writing to Health
+while the phone is locked.
 
-## Apple Health
-
-Apple Health has no internet API, so the Pi can't write to it. Instead, a Shortcut on your
-iPhone pulls from the Pi and logs each meal into Health as calories,
-protein, carbs and fat, timed at when you ate. Health's own nutrition views, including
-the redesigned Health app's, then show it. Don't also log the same food directly in
-Health, or it counts twice.
-
-Say *"set up Apple Health"* to the bot. It replies with your personal sync link and the
-Shortcut steps. Each person gets their own link, which works only on your home Wi-Fi.
-
-- **Only finished days are sent** (yesterday and earlier, up to 30 days back). A Shortcut
-  can't delete what it logged, so waiting for the day to end means fixes and undos never
-  leave stray entries in Health. Today's meals appear tomorrow.
-- **When it runs:** the suggested automation runs the Shortcut whenever you open Telegram.
-  iOS won't let anything write to Health while the phone is locked, so a timed overnight
-  automation would fail, but when you open Telegram the phone is unlocked. The Shortcut
-  first checks it's on your home Wi-Fi, since the link only works there, and does
-  nothing otherwise.
-- **Nothing is sent twice.** After logging, the Shortcut calls the link's `ack_url`, and
-  the Pi marks those days as done, so running it many times a day is harmless. Days
-  missed while you're away catch up the next time it runs at home.
-- **The link is a secret.** Anyone on your Wi-Fi who has it can read that person's daily
-  totals. Set `HEALTH_PORT=0` in `.env` to turn the sync off.
-
-What the link returns:
-
-```json
-{"samples": [{"day": "2026-11-24", "meal": "breakfast", "date": "Nov 24, 2026 at 9:42 AM",
-              "kcal": 255, "protein_g": 22.0, "carbs_g": 6.0, "fat_g": 14.0}, ...],
- "days": ["2026-11-24"],
- "ack_url": "http://jarvis.local:8787/health/<token>/ack?days=2026-11-24"}
-```
-
-## Setup
-
-The code is already deployed to `~/calorie-bot` on the Pi, with its `calorie-bot` service
-installed. What's left:
-
-### 1. Create the bot in Telegram
-1. Message **@BotFather** in Telegram and send `/newbot`. Pick a name and username.
-2. Copy the token it gives you.
-3. The bot has no commands, so leave its command menu empty. If you set one earlier, send
-   BotFather `/setcommands`, pick the bot, and reply `/empty` to clear it.
-
-### 2. Add the token on the Pi
-```bash
-ssh shawn@jarvis.local
-nano ~/calorie-bot/.env        # set TELEGRAM_BOT_TOKEN and TIMEZONE
-systemctl --user restart calorie-bot
-```
-
-### 3. Keep it running after you log out and across reboots
-The bot runs as a systemd *user* service, so it doesn't need root. To keep it running
-when you're not logged in, and to start it at boot, run this once on the Pi:
-```bash
-loginctl enable-linger shawn      # already done; add sudo if it ever asks
-```
-
-### 4. Lock the bot to you
-Message your bot. It replies with your Telegram user id. Put that id in `ALLOWED_USER_IDS`
-in `~/calorie-bot/.env`, then run `systemctl --user restart calorie-bot`. Until you do
-this, the bot answers no one. Keep it to just you: Anthropic's terms let you use your own
-subscription through Claude Code, but not to serve other people.
+- Only **finished days** are sent (yesterday and earlier, up to 30 days back). A Shortcut
+  can't delete what it logged, so waiting until the day is over means fixes never leave
+  stray entries. Today's meals show up tomorrow.
+- Each day is sent **once**: the Shortcut confirms afterwards, so running it often is fine.
+- The link works on your **home Wi-Fi only**, unless you set up something like Tailscale
+  (see [TODO.md](TODO.md)). Keep it private: it returns that person's daily totals.
+- Don't also log the same food straight into Health, or it counts twice.
 
 ## Running it
 
-- **Logs:** `ssh shawn@jarvis.local journalctl --user-unit calorie-bot -f`
-- **Restart:** `ssh shawn@jarvis.local systemctl --user restart calorie-bot`
-- **Update after code changes:** run `./deploy.sh` on your Mac. Your `.env` and data on the
-  Pi are kept. If you keep a `.env` next to `deploy.sh`, it's copied up and replaces the Pi's.
-- **Backup:** `scp shawn@jarvis.local:calorie-bot/data/calories.db .`
+```bash
+journalctl --user-unit calorie-bot -f      # live logs
+systemctl --user restart calorie-bot       # restart after editing .env
+git pull && ./install.sh --update          # update to the latest version
+cp data/calories.db ~/calories-backup.db   # back up your log
+```
 
-The bot uses long polling, so the Pi needs outbound internet only. No port forwarding.
+If you edit the code on another computer, `./deploy.sh user@your-pi.local` copies it
+to the Pi and runs the update there. The Pi keeps its own `.env` and `data/`.
 
-### If Claude Code's login expires
-The bot uses the login Claude Code already has on the Pi (`claude auth status` shows it).
-If estimates start failing with "isn't logged in", either run `claude` on the Pi and log
-in again, or run `claude setup-token` and put the token it prints (good for a year) in
-`.env` as `CLAUDE_CODE_OAUTH_TOKEN`.
+### Settings (`.env`)
+| Setting | What it does |
+|---|---|
+| `TELEGRAM_BOT_TOKEN` | From @BotFather |
+| `ALLOWED_USER_IDS` | Telegram user ids allowed to use the bot, comma-separated |
+| `TIMEZONE` | e.g. `America/New_York`; decides when "today" starts. Empty = the Pi's own |
+| `ESTIMATOR` | `claude-code` (subscription) or `api` (needs `ANTHROPIC_API_KEY`) |
+| `CLAUDE_MODEL` | Optional model for Claude Code, e.g. `opus` |
+| `CLAUDE_CODE_OAUTH_TOKEN` | Optional: a token from `claude setup-token` if the Pi's login expires |
+| `HEALTH_PORT` | Apple Health sync port, default `8787`; `0` turns it off |
+| `HEALTH_BASE_URL` | What the Health links point at; default `http://<hostname>.local:8787` |
+| `DB_PATH` | Where the SQLite file lives, default `data/calories.db` |
 
-Don't set `ANTHROPIC_API_KEY` for the bot unless you switch to API billing. The bot strips
-it from Claude Code's environment anyway, because Claude Code would otherwise bill the API.
+### Troubleshooting
+- **The bot doesn't answer:** check `journalctl --user-unit calorie-bot -n 50`. "Ignoring
+  message from unauthorized user" means that id isn't in `ALLOWED_USER_IDS`.
+- **"Claude Code isn't logged in":** run `claude` on the Pi and log in again, or put a
+  token from `claude setup-token` (valid for a year) in `.env` as `CLAUDE_CODE_OAUTH_TOKEN`.
+- **Claude Code bills the API instead of your plan:** if `ANTHROPIC_API_KEY` is set,
+  Claude Code uses it. The bot removes it before running Claude Code, but check your
+  shell profile if you run `claude` by hand.
+- **The bot stops when you log out:** run `sudo loginctl enable-linger $USER` once.
+- **Apple Health link doesn't load:** your phone must be on the same Wi-Fi as the Pi,
+  and the Pi must be reachable as `<hostname>.local` (set `HEALTH_BASE_URL` to its IP
+  if not).
 
-### Using an API key instead
-Set `ESTIMATOR=api` and `ANTHROPIC_API_KEY=...` in `.env`. The bot then calls the
-Anthropic API directly (`claude-opus-5-5`). That's faster but billed per token, at about
-1–2 cents a meal.
+## Privacy
+- Your log, recipes and goals stay in `data/calories.db` on your Pi.
+- Your messages pass through Telegram. Bot chats aren't end-to-end encrypted, so
+  Telegram can technically read them. They also go to Anthropic (Claude) to be estimated.
+- The Apple Health endpoint is only reachable on your home network, behind a per-person
+  secret link.
 
-## How it works
-
-- `calorie_bot/bot.py`: one message router. Short phrases get instant replies; everything
-  else goes to Claude, which returns an *intent* (log, fix, remove, goal, save recipe, …)
-  and the bot acts on it.
-- `calorie_bot/nutrition.py`: the estimate. With `ESTIMATOR=claude-code` the bot runs
-  `claude -p` in a throwaway folder. The message goes in on stdin and a JSON schema comes back
-  as structured output. Text runs get no tools, and photo runs may only read the photo. At
-  most two estimates run at once, to spare the Pi's memory.
-- `calorie_bot/health.py`: the Apple Health sync endpoint, a small standard-library web
-  server on port 8787 that runs inside the bot's process.
-- `calorie_bot/db.py`: SQLite. One row per food item, tagged with its meal and grouped by
-  the message it came from. "Today" is computed
-  in your `TIMEZONE`, so a midnight snack counts toward the right day.
-
-## Tests
+## Development
 ```bash
 python3 -m venv .venv && .venv/bin/pip install -r requirements.txt pytest
 .venv/bin/python -m pytest tests
 ```
+- `calorie_bot/bot.py`: the message router. Instant replies for short phrases;
+  everything else goes to Claude, which returns an intent the bot acts on.
+- `calorie_bot/nutrition.py`: the prompts and JSON schema, and the two backends:
+  `claude -p` with structured output, or the Anthropic API. Claude Code runs in a
+  throwaway folder with no tools for text, and with only the Read tool for a photo.
+- `calorie_bot/db.py`: SQLite storage, with upgrades for older databases on startup.
+- `calorie_bot/health.py`: the Apple Health sync endpoint (standard-library web server).
+
+## License
+[MIT](LICENSE)

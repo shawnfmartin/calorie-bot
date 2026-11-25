@@ -458,7 +458,7 @@ class Chat:
 
 @pytest.mark.parametrize("text,intent", [
     ("today", "today"), ("/today", "today"), ("What did I eat today?", "today"),
-    ("/week@shawn_calorie_tracker_bot", "week"), ("Undo", "undo"), ("/start", "help"),
+    ("/week@my_calorie_bot", "week"), ("Undo", "undo"), ("/start", "help"),
     ("my recipes", "recipes"), ("2 eggs", None), ("today I had 2 eggs", None),
 ])
 def test_quick_intents(text, intent):
@@ -791,11 +791,21 @@ def urlparse_path(url):
 
 
 def test_health_setup_reply(tmp_path, monkeypatch):
-    monkeypatch.setenv("HEALTH_BASE_URL", "http://jarvis.local:8787")
+    monkeypatch.setenv("HEALTH_BASE_URL", "http://raspberrypi.local:8787")
     chat = Chat(tmp_path)
     reply = chat.say("set up apple health")                      # instant, no Claude
     token = chat.store.health_token(1)
-    assert f"http://jarvis.local:8787/health/{token}" in reply and "Log Health Sample" in reply
+    assert f"http://raspberrypi.local:8787/health/{token}" in reply and "Log Health Sample" in reply
     assert chat.claude.calls == []
     assert "Apple Health sync" in chat.say("can you sync to my iphone health app?",
                                            claude_says("apple_health"))
+
+
+def test_configured_timezone(monkeypatch):
+    from calorie_bot.bot import configured_timezone
+    monkeypatch.setenv("TIMEZONE", "Europe/Berlin")
+    assert str(configured_timezone()) == "Europe/Berlin"
+    monkeypatch.setenv("TIMEZONE", "Not/AZone")
+    assert str(configured_timezone()) == "UTC"
+    monkeypatch.setenv("TIMEZONE", "")
+    assert configured_timezone() is not None        # the machine's own zone, or UTC

@@ -704,9 +704,25 @@ async def on_error(update: object, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
 # ---- wiring -----------------------------------------------------------------
 
+def configured_timezone() -> ZoneInfo:
+    """TIMEZONE from .env, else the machine's own zone, else UTC."""
+    name = os.environ.get("TIMEZONE", "").strip()
+    if not name:
+        try:  # /etc/localtime -> /usr/share/zoneinfo/Europe/Berlin
+            link = os.path.realpath("/etc/localtime")
+            name = link.split("zoneinfo/", 1)[1] if "zoneinfo/" in link else ""
+        except OSError:
+            name = ""
+    try:
+        return ZoneInfo(name or "UTC")
+    except Exception:  # an unknown name: say so, and don't crash the bot
+        log.warning("Unknown TIMEZONE %r; using UTC", name)
+        return ZoneInfo("UTC")
+
+
 def build_app() -> Application:
     token = os.environ["TELEGRAM_BOT_TOKEN"]
-    tz = ZoneInfo(os.environ.get("TIMEZONE", "America/Los_Angeles"))
+    tz = configured_timezone()
     db_path = os.environ.get("DB_PATH", "data/calories.db")
     os.makedirs(os.path.dirname(db_path) or ".", exist_ok=True)
     allowed = [int(x) for x in os.environ.get("ALLOWED_USER_IDS", "").replace(" ", "").split(",") if x]
