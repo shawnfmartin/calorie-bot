@@ -129,7 +129,7 @@ Dijon chicken: 879 kcal, 706 g raw → about 545 g cooked (estimated)
 ## Apple Health
 
 Apple Health has no internet API, so the Pi can't write to it. Instead, a Shortcut on your
-iPhone pulls from the Pi every morning and logs each meal into Health as calories,
+iPhone pulls from the Pi and logs each meal into Health as calories,
 protein, carbs and fat, timed at when you ate. Health's own nutrition views, including
 the redesigned Health app's, then show it. Don't also log the same food directly in
 Health, or it counts twice.
@@ -140,9 +140,14 @@ Shortcut steps. Each person gets their own link, which works only on your home W
 - **Only finished days are sent** (yesterday and earlier, up to 30 days back). A Shortcut
   can't delete what it logged, so waiting for the day to end means fixes and undos never
   leave stray entries in Health. Today's meals appear tomorrow.
+- **When it runs:** the suggested automation runs the Shortcut whenever you open Telegram.
+  iOS won't let anything write to Health while the phone is locked, so a timed overnight
+  automation would fail, but when you open Telegram the phone is unlocked. The Shortcut
+  first checks it's on your home Wi-Fi, since the link only works there, and does
+  nothing otherwise.
 - **Nothing is sent twice.** After logging, the Shortcut calls the link's `ack_url`, and
-  the Pi marks those days as done. If the phone isn't home one morning, the next run
-  catches up.
+  the Pi marks those days as done, so running it many times a day is harmless. Days
+  missed while you're away catch up the next time it runs at home.
 - **The link is a secret.** Anyone on your Wi-Fi who has it can read that person's daily
   totals. Set `HEALTH_PORT=0` in `.env` to turn the sync off.
 

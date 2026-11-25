@@ -441,15 +441,19 @@ async def health_reply(msg, store: Store, user_id: int) -> None:
     waiting = len(pending_days(store, user_id))
     lines = [
         "❤️ <b>Apple Health sync</b>",
-        "A Shortcut on your iPhone copies each finished day into Health every morning: "
-        "calories, protein, carbs and fat for each meal. Today's meals go in tomorrow, so "
-        "anything you fix or undo today doesn't leave stray entries in Health.",
+        "A Shortcut on your iPhone copies each finished day into Health: calories, protein, "
+        "carbs and fat for each meal. It runs when you open Telegram, because iOS won't let "
+        "anything write to Health while the phone is locked. Today's meals go in tomorrow, "
+        "so anything you fix or undo today doesn't leave stray entries in Health.",
         "",
         "<b>Your personal link</b> (keep it private):",
         f"<code>{html.escape(link)}</code>",
         "It only works on your home Wi-Fi.",
         "",
         "<b>Make the Shortcut</b> (Shortcuts app → +), adding these actions in order:",
+        "0. <b>Get Network Details</b>: Wi-Fi Network Name, then <b>If</b> Network Details "
+        "is your home Wi-Fi name. Put everything below inside the If, and leave Otherwise "
+        "empty, so away from home it quietly does nothing.",
         "1. <b>Get Contents of URL</b>: paste your link",
         "2. <b>Get Dictionary Value</b>: Value for <code>samples</code> in Contents of URL",
         "3. <b>Repeat with Each</b> item in Dictionary Value. Inside the repeat:",
@@ -464,9 +468,10 @@ async def health_reply(msg, store: Store, user_id: int) -> None:
         "",
         "Run it once by hand so iOS asks to let Shortcuts write to Health; allow it.",
         "",
-        "<b>Run it every morning:</b> Shortcuts → Automation → + → Time of Day, e.g. 6:00 AM, "
-        "Daily, <i>Run Immediately</i>. If your phone isn't home one morning, the next run "
-        "catches up.",
+        "<b>Run it automatically:</b> Shortcuts → Automation → + → App → Telegram → "
+        "<i>Is Opened</i> → <i>Run Immediately</i> → pick this Shortcut. Running it often is "
+        "fine: once a day is synced it's never sent again, and days missed while you're away "
+        "catch up next time you open Telegram at home.",
         "",
         f"Days waiting to sync: {waiting}." if waiting else "Nothing waiting to sync yet.",
     ]
