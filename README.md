@@ -41,6 +41,8 @@ There are no commands to learn. Everything is a normal message.
   yields, and you can replace that with a real weighing.
 - **Apple Health sync** through an iPhone Shortcut: each finished day goes in as
   calories, protein, carbs and fat per meal.
+- **Meal reminders:** if breakfast, lunch or dinner isn't logged by its time, the bot
+  reminds you once. Change times or turn them off in plain words.
 - **More than one person:** each person gets their own log, recipes, goal and Health link.
 - **Private:** it answers only the Telegram accounts you allow.
 
@@ -142,6 +144,7 @@ then run `systemctl --user restart calorie-bot`.
 | Save a recipe | *"save this as my chili:"* followed by the ingredients |
 | Manage recipes | *"show my recipes"*, *"rename it to …"*, *"delete the chili recipe"* |
 | Apple Health | *"set up Apple Health"* |
+| Reminders | *"remind me about lunch at 1pm"*, *"no breakfast reminders"*, *"turn off reminders"*, *"I skipped lunch"* |
 
 The bot remembers your last few messages, so "it" means whatever you were just talking
 about. Deleting a recipe asks you to reply "yes" first.
@@ -168,6 +171,14 @@ Dijon chicken: 879 kcal, 706 g raw → about 545 g cooked (estimated)
 ```
 For exact numbers, weigh the finished dish once: *"the dijon chicken weighed 520 g after
 cooking"*. Say *"100g raw …"* to log a raw weight instead.
+
+### Meal reminders
+By default the bot checks at 10:30 (breakfast), 14:30 (lunch) and 20:30 (dinner). If you
+haven't logged anything for that meal yet, it sends one reminder. It never sends a second
+one that day. "I skipped lunch" means no reminder for it. If you answer a reminder with
+food, it's logged as that meal, even late at night. Reminders only go out within 2 hours
+of their time, so a Pi that was off all afternoon won't send a stale one. Change the
+defaults for everyone with `REMINDERS` in `.env`.
 
 ### Apple Health
 Apple Health has no internet API, so the Pi can't write to it directly. A Shortcut on
@@ -210,6 +221,7 @@ to the Pi and runs the update there. The Pi keeps its own `.env` and `data/`.
 | `CLAUDE_CODE_OAUTH_TOKEN` | Optional: a token from `claude setup-token` if the Pi's login expires |
 | `HEALTH_PORT` | Apple Health sync port, default `8787`; `0` turns it off |
 | `HEALTH_BASE_URL` | What the Health links point at; default `http://<hostname>.local:8787` |
+| `REMINDERS` | Default reminder times, e.g. `breakfast=10:30,lunch=14:30,dinner=20:30`, or `off`. Each person can change their own |
 | `DB_PATH` | Where the SQLite file lives, default `data/calories.db` |
 
 ### Troubleshooting
@@ -243,6 +255,7 @@ python3 -m venv .venv && .venv/bin/pip install -r requirements.txt pytest
   `claude -p` with structured output, or the Anthropic API. Claude Code runs in a
   throwaway folder with no tools for text, and with only the Read tool for a photo.
 - `calorie_bot/db.py`: SQLite storage, with upgrades for older databases on startup.
+- `calorie_bot/reminders.py`: the once-a-minute reminder check.
 - `calorie_bot/health.py`: the Apple Health sync endpoint (standard-library web server).
 
 ## License

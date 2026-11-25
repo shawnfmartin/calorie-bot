@@ -26,6 +26,7 @@ from telegram.ext import Application, ContextTypes, MessageHandler, filters
 from .db import MEALS, Entry, Recipe, Store, meal_for_time
 from .health import pending_days, start_server, sync_link
 from .nutrition import EstimateError, make_estimator
+from . import reminders
 
 log = logging.getLogger("calorie_bot")
 
@@ -40,6 +41,8 @@ Just talk to me. Some things you can say:
    · <i>undo</i>
 🎯 <i>set my goal to 2000</i> · <i>what's my goal?</i>
 ❤️ <i>set up Apple Health</i> (sends each finished day to the Health app)
+⏰ <i>remind me about lunch at 1pm</i> · <i>no breakfast reminders</i> · <i>I skipped lunch</i>
+   (I remind you once if a meal isn't logged by its time)
 
 📖 <b>Recipes</b>
 <i>save this as my vinaigrette:</i> and the ingredients (I'll make up a name if you don't give one)
@@ -209,6 +212,8 @@ QUICK = {
     "undo": {"undo", "undo that", "undo last", "scratch that"},
     "help": {"help", "start", "what can you do", "how does this work", "commands", "menu"},
     "recipes": {"recipes", "my recipes", "list recipes", "show recipes", "show my recipes"},
+    "reminders": {"reminders", "my reminders", "show reminders", "show my reminders",
+                  "what are my reminders", "reminder settings"},
     "health": {"apple health", "health", "health sync", "sync health", "set up apple health",
                "setup apple health", "connect apple health", "sync apple health"},
 }
@@ -361,6 +366,11 @@ async def claude_reply(update, ctx, msg, store: Store, user_id: int, text: str,
         await help_reply(msg, store, user_id)
     elif intent == "apple_health":
         await health_reply(msg, store, user_id)
+    elif intent == "set_reminders":
+        await set_reminders_reply(msg, store, user_id, meal,
+                                  (result.get("reminder_time") or "").strip().lower())
+    elif intent == "skip_meal":
+        await skip_meal_reply(msg, store, user_id, meal)
     elif intent in ("log_meal", "correct_log") and result.get("items"):
         await log_items_reply(msg, store, user_id, result["items"], note, text or "photo",
                               replace_ids=entry_ids if intent == "correct_log" else [], meal=meal)
@@ -476,6 +486,39 @@ async def week_reply(msg, store: Store, user_id: int) -> None:
 
 async def help_reply(msg, store: Store, user_id: int) -> None:
     await msg.reply_text(HELP, parse_mode=ParseMode.HTML)
+
+
+def reminders_text(store: Store, user_id: int) -> str:
+    current = store.get_reminders(user_id, reminders.default_reminders())
+    lines = ["⏰ <b>Meal reminders</b> (once a day, only if the meal isn't logged yet)"]
+    for meal, when in current.items():
+        state = reminders.fmt_time(when) if when else "off"
+        lines.append(f"{MEAL_ICONS[meal]} {meal.capitalize()}: {state}")
+    lines.append("\nChange one: “remind me about lunch at 1pm”, “no breakfast reminders”, "
+                 "“turn off reminders”.")
+    return "\n".join(lines)
+
+
+async def reminders_reply(msg, store: Store, user_id: int) -> None:
+    await msg.reply_text(reminders_text(store, user_id), parse_mode=ParseMode.HTML)
+
+
+async def set_reminders_reply(msg, store: Store, user_id: int, meal: str, value: str) -> None:
+    if value and value not in ("on", "off") and not reminders.TIME_RE.match(value):
+        await msg.reply_text("I didn't catch the time. Try e.g. “remind me about lunch at 1pm”.")
+        return
+    if value:
+        reminders.apply_change(store, user_id, meal, value)
+    await reminders_reply(msg, store, user_id)
+
+
+async def skip_meal_reply(msg, store: Store, user_id: int, meal: str) -> None:
+    if meal not in MEALS:
+        await msg.reply_text("Which meal did you skip?")
+        return
+    store.mark_reminder(user_id, store.today(), meal, "skipped")
+    where = "snacks" if meal == "snack" else meal
+    await msg.reply_text(f"Okay, no {where} today. I won't remind you about it.")
 
 
 def health_port() -> int:
@@ -730,7 +773,8 @@ async def delete_recipe_reply(msg, store: Store, user_id: int, name: str) -> Non
 
 
 QUICK_REPLIES = {"today": today_reply, "week": week_reply, "undo": undo_reply,
-                 "help": help_reply, "recipes": recipes_reply, "health": health_reply}
+                 "help": help_reply, "recipes": recipes_reply, "health": health_reply,
+                 "reminders": reminders_reply}
 
 
 # ---- access and errors ------------------------------------------------------
@@ -777,9 +821,25 @@ def build_app() -> Application:
     allowed = [int(x) for x in os.environ.get("ALLOWED_USER_IDS", "").replace(" ", "").split(",") if x]
 
     store = Store(db_path, tz)
-    app = Application.builder().token(token).concurrent_updates(True).build()
+
+    async def start_reminders(application: Application) -> None:
+        if allowed:
+            application.bot_data["reminder_task"] = asyncio.create_task(
+                reminders.reminder_loop(application, allowed))
+            log.info("Meal reminders on for %d user(s)", len(allowed))
+
+    async def stop_reminders(application: Application) -> None:
+        task = application.bot_data.pop("reminder_task", None)
+        if task:
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+
+    app = (Application.builder().token(token).concurrent_updates(True)
+           .post_init(start_reminders).post_shutdown(stop_reminders).build())
     app.bot_data["store"] = store
     app.bot_data["estimator"] = make_estimator()
+    app.bot_data["memory"] = ChatMemory()
 
     if allowed:
         me = filters.User(user_id=allowed)

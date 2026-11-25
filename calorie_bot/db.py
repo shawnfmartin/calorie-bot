@@ -48,7 +48,16 @@ CREATE TABLE IF NOT EXISTS recipes (
 CREATE TABLE IF NOT EXISTS settings (
     user_id      INTEGER PRIMARY KEY,
     daily_goal   INTEGER,
-    health_token TEXT                      -- secret in the user's Apple Health sync link
+    health_token TEXT,                     -- secret in the user's Apple Health sync link
+    reminders    TEXT                      -- JSON {"breakfast": "10:30" | null, ...}; NULL = defaults
+);
+
+CREATE TABLE IF NOT EXISTS reminders_done (  -- one reminder per meal per day, at most
+    user_id INTEGER NOT NULL,
+    day     TEXT    NOT NULL,
+    meal    TEXT    NOT NULL,
+    kind    TEXT    NOT NULL,              -- sent | skipped
+    PRIMARY KEY (user_id, day, meal)
 );
 
 CREATE TABLE IF NOT EXISTS claude_usage (   -- Claude calls per person per day, for the daily cap
@@ -81,6 +90,7 @@ class Entry:
 
 
 MEALS = ("breakfast", "lunch", "dinner", "snack")
+REMINDER_MEALS = ("breakfast", "lunch", "dinner")
 
 
 def meal_for_time(when: datetime) -> str:
@@ -174,6 +184,8 @@ class Store:
         settings_cols = {r["name"] for r in self.conn.execute("PRAGMA table_info(settings)")}
         if "health_token" not in settings_cols:
             self.conn.execute("ALTER TABLE settings ADD COLUMN health_token TEXT")
+        if "reminders" not in settings_cols:
+            self.conn.execute("ALTER TABLE settings ADD COLUMN reminders TEXT")
         recipe_cols = {r["name"] for r in self.conn.execute("PRAGMA table_info(recipes)")}
         if "raw_weight_g" not in recipe_cols:
             self.conn.execute("ALTER TABLE recipes ADD COLUMN raw_weight_g REAL NOT NULL DEFAULT 0")
@@ -338,6 +350,35 @@ class Store:
         self.conn.commit()
         return self.conn.execute("SELECT calls FROM claude_usage WHERE user_id=? AND day=?",
                                  (user_id, day)).fetchone()["calls"]
+
+    # ---- meal reminders ------------------------------------------------------
+
+    def get_reminders(self, user_id: int, defaults: dict[str, str | None]) -> dict[str, str | None]:
+        """Reminder time ("HH:MM") per meal, or None where it's off."""
+        row = self.conn.execute("SELECT reminders FROM settings WHERE user_id=?",
+                                (user_id,)).fetchone()
+        saved = json.loads(row["reminders"]) if row and row["reminders"] else {}
+        return {meal: saved.get(meal, defaults.get(meal)) for meal in REMINDER_MEALS}
+
+    def set_reminders(self, user_id: int, reminders: dict[str, str | None]) -> None:
+        self.conn.execute(
+            "INSERT INTO settings (user_id, reminders) VALUES (?, ?)"
+            " ON CONFLICT(user_id) DO UPDATE SET reminders=excluded.reminders",
+            (user_id, json.dumps(reminders)))
+        self.conn.commit()
+
+    def reminder_done(self, user_id: int, day: date, meal: str) -> str | None:
+        row = self.conn.execute(
+            "SELECT kind FROM reminders_done WHERE user_id=? AND day=? AND meal=?",
+            (user_id, day.isoformat(), meal)).fetchone()
+        return row["kind"] if row else None
+
+    def mark_reminder(self, user_id: int, day: date, meal: str, kind: str) -> None:
+        self.conn.execute(
+            "INSERT INTO reminders_done (user_id, day, meal, kind) VALUES (?, ?, ?, ?)"
+            " ON CONFLICT(user_id, day, meal) DO UPDATE SET kind=excluded.kind",
+            (user_id, day.isoformat(), meal, kind))
+        self.conn.commit()
 
     # ---- Apple Health sync ---------------------------------------------------
 

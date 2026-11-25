@@ -856,3 +856,82 @@ def test_claude_usage_counts_per_user_per_day(tmp_path):
 def test_claude_code_runs_at_low_effort(fake_claude):
     _, calls = fake_claude({"is_error": False, "structured_output": {"items": [], "note": ""}}, text="x")
     assert "--effort low" in calls
+
+
+# ---- meal reminders -----------------------------------------------------------------
+
+from calorie_bot import reminders as rem  # noqa: E402
+
+
+def at(s, hh, mm=0):
+    return datetime.combine(s.today(), datetime.min.time(), TZ) + timedelta(hours=hh, minutes=mm)
+
+
+class FakeApp:
+    def __init__(self, store):
+        self.bot_data = {"store": store, "memory": __import__("calorie_bot.bot", fromlist=["ChatMemory"]).ChatMemory()}
+        self.sent = []
+        self.bot = self
+
+    async def send_message(self, chat_id, text):
+        self.sent.append((chat_id, text))
+
+
+def test_reminder_due_only_in_window_and_only_once(tmp_path, monkeypatch):
+    monkeypatch.delenv("REMINDERS", raising=False)
+    s = Store(tmp_path / "t.db", TZ)
+    assert rem.due_reminders(s, 1, at(s, 10, 29)) == []
+    assert rem.due_reminders(s, 1, at(s, 10, 30)) == ["breakfast"]
+    assert rem.due_reminders(s, 1, at(s, 12, 31)) == []                    # past the 2 h window
+    app = FakeApp(s)
+    asyncio.run(rem.send_due(app, s, [1], at(s, 10, 45)))
+    assert app.sent == [(1, rem.MESSAGES["breakfast"])]
+    asyncio.run(rem.send_due(app, s, [1], at(s, 11, 0)))
+    assert len(app.sent) == 1                                               # only once
+    assert "Haven't logged breakfast" in app.bot_data["memory"].lines(1)[-1]  # Claude sees it
+
+
+def test_no_reminder_when_meal_logged_or_skipped(tmp_path, monkeypatch):
+    monkeypatch.delenv("REMINDERS", raising=False)
+    s = Store(tmp_path / "t.db", TZ)
+    s.add_items(1, "x", [item("salad", 300)], "a", at(s, 12), meal="lunch")
+    assert rem.due_reminders(s, 1, at(s, 14, 40)) == []
+    s.mark_reminder(1, s.today(), "dinner", "skipped")
+    assert rem.due_reminders(s, 1, at(s, 20, 40)) == []
+    assert rem.due_reminders(s, 2, at(s, 20, 40)) == ["dinner"]          # per user
+
+
+def test_reminder_settings(tmp_path, monkeypatch):
+    monkeypatch.delenv("REMINDERS", raising=False)
+    s = Store(tmp_path / "t.db", TZ)
+    assert rem.apply_change(s, 1, "lunch", "13:00")["lunch"] == "13:00"
+    assert rem.apply_change(s, 1, "breakfast", "off")["breakfast"] is None
+    assert rem.due_reminders(s, 1, at(s, 13, 5)) == ["lunch"]
+    everything_off = rem.apply_change(s, 1, "", "off")
+    assert set(everything_off.values()) == {None}
+    assert rem.apply_change(s, 1, "", "on") == {"breakfast": "10:30", "lunch": "14:30", "dinner": "20:30"}
+    assert rem.fmt_time("14:30") == "2:30 PM" and rem.normalize_time("9:05") == "09:05"
+
+
+@pytest.mark.parametrize("env,expected", [
+    ("", {"breakfast": "10:30", "lunch": "14:30", "dinner": "20:30"}),
+    ("off", {"breakfast": None, "lunch": None, "dinner": None}),
+    ("lunch=12:15, dinner=19:00", {"breakfast": None, "lunch": "12:15", "dinner": "19:00"}),
+])
+def test_default_reminders_from_env(monkeypatch, env, expected):
+    monkeypatch.setenv("REMINDERS", env)
+    assert rem.default_reminders() == expected
+
+
+def test_reminders_in_plain_words(tmp_path, monkeypatch):
+    monkeypatch.delenv("REMINDERS", raising=False)
+    chat = Chat(tmp_path)
+    assert "Lunch: 2:30 PM" in chat.say("reminders")                       # instant
+    assert "Lunch: 1:00 PM" in chat.say("remind me about lunch at 1pm", claude_says(
+        "set_reminders", meal="lunch", reminder_time="13:00"))
+    assert "Breakfast: off" in chat.say("no breakfast reminders", claude_says(
+        "set_reminders", meal="breakfast", reminder_time="off"))
+    assert "didn't catch the time" in chat.say("remind me at teatime", claude_says(
+        "set_reminders", meal="dinner", reminder_time="teatime"))
+    assert "won't remind you" in chat.say("I skipped dinner", claude_says("skip_meal", meal="dinner"))
+    assert chat.store.reminder_done(1, chat.store.today(), "dinner") == "skipped"

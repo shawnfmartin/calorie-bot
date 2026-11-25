@@ -120,6 +120,13 @@ Set `intent` to exactly one of:
 - "delete_recipe": the user wants to delete a saved recipe. Set `recipe.name` to its exact name.
   (The bot asks them to confirm.)
 - "apple_health": the user wants to connect, sync or set up Apple Health, or asks how.
+- "set_reminders": the user is changing or asking about meal reminders (the bot reminds them
+  once if a meal isn't logged by a set time). Set `meal` to "breakfast", "lunch" or "dinner",
+  or "" for all of them, and `reminder_time` to the new time as 24-hour "HH:MM" ("remind me
+  about lunch at 1pm" = "13:00"), "off" to turn it off, "on" to turn it back on at the
+  default time, or "" if they're only asking what their reminders are.
+- "skip_meal": the user says they skipped, or won't have, a meal today ("I skipped lunch",
+  "no breakfast today"). Set `meal`. (The bot then won't remind them about it today.)
 - "help": the user is asking what the bot can do or how to use it.
 - "other": anything else. Put a one-sentence reply in `note`, at most 25 words.
 
@@ -137,9 +144,11 @@ Meals: `meal` is one of "breakfast", "lunch", "dinner", "snack". When logging, u
 user names ("for lunch", "dinner was...", "a snack"); otherwise pick it from the current time,
 which is given with the message: before 11:00 breakfast, 11:00 to 16:00 lunch, 16:00 to 22:00
 dinner, otherwise snack. Something eaten between meals that they call a snack is a snack.
+If the bot's last message reminded them about a meal ("Haven't logged dinner yet…") and they
+reply with food, it's that meal, whatever the time.
 
 Only fill the fields an intent uses. Leave the rest empty: `items` [], `entry_ids` [],
-`goal_kcal` 0, `meal` "", `day_offset` 0, `rename_to` "", and `recipe` with an empty name, no ingredients and zeros (except
+`goal_kcal` 0, `meal` "", `day_offset` 0, `reminder_time` "", `rename_to` "", and `recipe` with an empty name, no ingredients and zeros (except
 `recipe.name` where described above).
 
 Recipe rules:
@@ -176,7 +185,7 @@ _RECIPE_KEYS = list(_RECIPE_PROPS)
 
 INTENTS = ["log_meal", "correct_log", "move_entries", "delete_entries", "undo_last", "show_day",
            "show_week",
-           "set_goal", "apple_health", "save_recipe", "update_recipe", "rename_recipe", "show_recipe",
+           "set_goal", "apple_health", "set_reminders", "skip_meal", "save_recipe", "update_recipe", "rename_recipe", "show_recipe",
            "list_recipes", "delete_recipe", "help", "other"]
 
 MEAL_SCHEMA = {
@@ -205,12 +214,14 @@ MEAL_SCHEMA = {
         "goal_kcal": {"type": "number"},
         "meal": {"type": "string", "enum": ["breakfast", "lunch", "dinner", "snack", ""]},
         "day_offset": {"type": "integer"},
+        "reminder_time": {"type": "string"},
         "rename_to": {"type": "string"},
         "recipe": {"type": "object", "properties": _RECIPE_PROPS, "required": _RECIPE_KEYS,
                    "additionalProperties": False},
         "note": {"type": "string"},
     },
-    "required": ["intent", "items", "entry_ids", "goal_kcal", "meal", "day_offset", "recipe",
+    "required": ["intent", "items", "entry_ids", "goal_kcal", "meal", "day_offset",
+                 "reminder_time", "recipe",
                  "rename_to", "note"],
     "additionalProperties": False,
 }
