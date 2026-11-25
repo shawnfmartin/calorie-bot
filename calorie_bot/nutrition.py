@@ -136,10 +136,18 @@ Set `intent` to exactly one of:
   weight", "lose 0.5 kg a week", "get to 75 kg"), or how they want to be coached ("be harsh
   with me", "be encouraging", "stop commenting on my meals"). Fill only what they said in
   `profile`, converting to metric: pounds x 0.4536 = kg, feet/inches to cm, stone x 6.35 = kg.
-  Activity: "sedentary" (desk job, little exercise), "light" (exercise 1-3 days/week),
-  "moderate" (3-5 days), "active" (6-7 days or hard training), "very_active" (physical job
-  plus training). Coaching: harsh, blunt, tough love, no sugar-coating = "tough"; supportive,
-  nice, encouraging = "encouraging"; no comments = "off". Leave everything not mentioned
+  Activity (count an on-your-feet job like nurse, retail or waiting tables as about two
+  exercise days; light sessions like yoga or walks count half):
+    "sedentary": desk job, exercise less than 1 day a week
+    "light": desk job + 1-3 days, or on-your-feet job with no exercise
+    "moderate": desk job + 3-5 days, or on-your-feet job + 1-3 days
+    "active": desk job + hard training 6-7 days, on-your-feet job + 4 or more days, or heavy
+      manual work (construction, farming, moving)
+    "very_active": heavy manual work plus hard training most days, or training twice a day
+  When unsure between two levels, pick the lower one. Coaching: harsh, blunt, tough love, no sugar-coating = "tough"; supportive,
+  nice, encouraging = "encouraging"; no comments, no coaching = "off". A one- or two-word reply
+  like "tough love" or "encouraging" right after the bot asked how to comment on meals is
+  "update_profile" with just `coach_tone`. Leave everything not mentioned
   empty or 0.
 - "show_profile": the user asks for their targets, profile, plan, or how much they should eat.
 - "help": the user is asking what the bot can do or how to use it.

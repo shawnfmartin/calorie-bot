@@ -148,7 +148,7 @@ then run `systemctl --user restart calorie-bot`.
 | Fix an entry | *"actually it was 2 eggs, not 3"*, *"the rice was 150g"* |
 | Move to another meal | *"the salad was actually dinner"* |
 | Remove an entry | *"remove the toast"*, *"undo"* |
-| Work out targets | *"I want to lose weight"*, then age, height, weight and activity in any order |
+| Work out targets | *"set up my goals"*, or *"I want to lose weight"* and go from there |
 | See targets | *"my targets"*, *"how much should I eat?"* |
 | Log weight | *"I weigh 83 kg today"* (also updates your targets) |
 | Coaching tone | *"be tough on me"*, *"be encouraging"*, *"no coaching"* |
@@ -187,7 +187,10 @@ For exact numbers, weigh the finished dish once: *"the dijon chicken weighed 520
 cooking"*. Say *"100g raw …"* to log a raw weight instead.
 
 ### Targets and coaching
-Tell the bot your goal and a little about yourself, over as many messages as you like.
+Say *"set up my goals"* and the bot lists everything it needs in one message: your
+goal, age, sex (optional), height, weight, how active you are, and how you'd like your
+meals commented on. If you haven't set up goals, the bot mentions this once, after your
+first logged meal. You can also just start talking, over as many messages as you like.
 It remembers what you've said and asks only for what's still missing:
 
 ```

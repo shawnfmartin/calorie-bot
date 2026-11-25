@@ -148,9 +148,11 @@ def profile_card(profile: dict, t: Targets) -> str:
     elif t.rate_kg_week > 0:
         lines.append(f"Surplus: {t.calories - t.tdee:,.0f} kcal a day")
     lines += [f"⚠️ {n}" for n in t.notes]
-    tone = profile.get("coach_tone") or "encouraging"
-    lines += ["",
-              f"Coaching on your meals: <b>{tone}</b>. Say “be tough on me”, “be encouraging” "
-              "or “no coaching” to change it.",
-              "<i>Estimates for healthy adults, not medical advice.</i>"]
+    tone = profile.get("coach_tone")
+    lines.append("")
+    lines.append("If your activity level looks off, tell me, e.g. “I'm more lightly active”.")
+    if tone:
+        lines.append(f"Coaching on your meals: <b>{tone}</b>. Say “be tough on me”, "
+                     "“be encouraging” or “no coaching” to change it.")
+    lines.append("<i>Estimates for healthy adults, not medical advice.</i>")
     return "\n".join(lines)

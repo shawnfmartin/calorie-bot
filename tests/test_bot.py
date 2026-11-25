@@ -1126,3 +1126,41 @@ def test_verdict_slightly_under_is_on_target(tmp_path):
     s.set_goal(1, 2000)
     s.add_items(1, "x", [item("food", 1850)], "a", meal="lunch")
     assert "✅ on target, 150 under" in day_verdict(s, 1)
+
+
+# ---- setup prompts -------------------------------------------------------------------
+
+def blank_profile(**kw):
+    return {"sex": "", "age": 0, "height_cm": 0, "weight_kg": 0, "activity": "", "goal": "",
+            "rate_kg_week": 0, "target_weight_kg": 0, "coach_tone": "", **kw}
+
+
+def test_setup_nudge_only_once(tmp_path):
+    chat = Chat(tmp_path)
+    first = chat.say("eggs", claude_says("log_meal", meal="breakfast", items=[food("eggs", 200)]))
+    assert "Say “set up my goals”" in first
+    second = chat.say("toast", claude_says("log_meal", meal="breakfast", items=[food("toast", 80)]))
+    assert "set up my goals" not in second
+    assert tg.missing_fields(chat.store.get_profile(1))       # the flag doesn't count as set up
+
+
+def test_no_nudge_once_set_up(tmp_path):
+    chat = Chat(tmp_path)
+    chat.store.update_profile(1, {**ME, "coach_tone": "encouraging"})
+    reply = chat.say("eggs", claude_says("log_meal", meal="breakfast", items=[food("eggs", 200)]))
+    assert "set up my goals" not in reply
+
+
+def test_set_up_my_goals_is_instant(tmp_path):
+    chat = Chat(tmp_path)
+    reply = chat.say("set up my goals")
+    assert "Let's set up your goals" in reply and "tough love" in reply and chat.claude.calls == []
+
+
+def test_tone_question_until_chosen(tmp_path):
+    chat = Chat(tmp_path)
+    reply = chat.say("all of it", claude_says("update_profile", profile=blank_profile(**ME)))
+    assert "Your targets" in reply and "how should I comment on your meals" in reply
+    reply = chat.say("tough love", claude_says("update_profile", profile=blank_profile(coach_tone="tough")))
+    assert "Tough love it is" in reply
+    assert "how should I comment" not in chat.say("my targets")       # asked only while unset

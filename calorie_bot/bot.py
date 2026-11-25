@@ -40,7 +40,7 @@ Just talk to me. Some things you can say:
    · <i>how did I do this week?</i>
 ✏️ <i>actually it was 2 eggs, not 3</i> · <i>remove the toast</i> · <i>the arugula was dinner</i>
    · <i>undo</i>
-🎯 <i>I want to lose weight</i>, then tell me your age, height, weight and activity, and I'll
+🎯 <i>set up my goals</i>, or just <i>I want to lose weight</i>, then tell me your age, height, weight and activity, and I'll
    work out your calories and macros · <i>my targets</i> · <i>set my goal to 2000</i>
 💬 <i>be tough on me</i> · <i>be encouraging</i> · <i>no coaching</i> (comments on your meals)
 ⚖️ <i>I weigh 82 kg today</i>
@@ -214,6 +214,8 @@ QUICK = {
              "week summary", "show summary", "graph", "chart", "show my graph"},
     "weekly_settings": {"weekly summary settings"},
     "profile": {"targets", "my targets", "profile", "my profile", "my plan", "my macros"},
+    "setup": {"set up my goals", "setup my goals", "set up goals", "set my goals", "get started",
+              "set up", "setup", "onboarding", "start setup", "set up my profile"},
     "undo": {"undo", "undo that", "undo last", "scratch that"},
     "help": {"help", "start", "what can you do", "how does this work", "commands", "menu"},
     "recipes": {"recipes", "my recipes", "list recipes", "show recipes", "show my recipes"},
@@ -456,6 +458,9 @@ async def log_items_reply(msg, store: Store, user_id: int, items: list[dict], no
     lines += ["", day_summary(store, user_id)]
     if not was_complete and day_complete(store, user_id):
         lines += ["", day_verdict(store, user_id)]
+    nudge = setup_nudge(store, user_id)
+    if nudge:
+        lines += ["", nudge]
     await msg.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
 
 
@@ -490,8 +495,8 @@ def day_verdict(store: Store, user_id: int) -> str:
 
 def coaching_on(store: Store, user_id: int) -> bool:
     profile = store.get_profile(user_id)
-    return bool(store.get_goal(user_id)) and (profile.get("coach_tone") or "encouraging") != "off" \
-        and bool(profile)
+    return bool(store.get_goal(user_id)) and not tgt.missing_fields(profile) \
+        and (profile.get("coach_tone") or "encouraging") != "off"
 
 
 def coaching_context(store: Store, user_id: int) -> str | None:
@@ -512,6 +517,43 @@ def coaching_context(store: Store, user_id: int) -> str | None:
         parts.append(f"protein target {macros.get('protein_g')} g")
     parts.append(f"eaten today before this message: {eaten} kcal, protein {protein:.0f} g")
     return "; ".join(parts)
+
+
+SETUP_TEXT = """🎯 <b>Let's set up your goals</b>
+Answer in one message or a few, in your own words and units:
+
+1. Your goal: lose, maintain or gain weight? (A pace like “0.5 kg a week” or a target weight
+   is optional.)
+2. Age
+3. Sex (optional, makes the estimate more accurate)
+4. Height
+5. Current weight
+6. How active you are: desk job? how many days a week you exercise?
+7. How should I comment on your meals: <b>encouraging</b>, <b>tough love</b>, or <b>not at all</b>?
+
+For example: <i>“lose weight, 34, male, 5'11, 190 lbs, desk job, gym 4 days a week, be tough
+on me”</i>
+
+I'll work out your daily calories and macros with the standard Mifflin-St Jeor formula and
+show you how I got there."""
+
+
+async def setup_reply(msg, store: Store, user_id: int) -> None:
+    await msg.reply_text(SETUP_TEXT, parse_mode=ParseMode.HTML)
+
+
+def setup_nudge(store: Store, user_id: int) -> str | None:
+    """A one-time invitation to set up goals, for people who haven't."""
+    profile = store.get_profile(user_id)
+    if not tgt.missing_fields(profile) or profile.get("setup_prompted"):
+        return None
+    store.update_profile(user_id, {"setup_prompted": True})
+    return ("💡 Want me to work out your calorie and macro targets and coach you on your "
+            "meals? Say “set up my goals”. (I'll only mention this once.)")
+
+
+TONE_QUESTION = ("💬 One more thing: how should I comment on your meals? Reply "
+                 "<b>encouraging</b>, <b>tough love</b>, or <b>no coaching</b>.")
 
 
 def missing_profile_text(missing: list[str]) -> str:
@@ -556,7 +598,10 @@ async def update_profile_reply(msg, store: Store, user_id: int, changes: dict) -
     head = ""
     if changes.get("weight_kg") and len(changes) == 1:
         head = f"⚖️ Logged {float(changes['weight_kg']):g} kg and updated your targets.\n\n"
-    await msg.reply_text(head + tgt.profile_card(profile, t), parse_mode=ParseMode.HTML)
+    text = head + tgt.profile_card(profile, t)
+    if not profile.get("coach_tone"):
+        text += "\n\n" + TONE_QUESTION
+    await msg.reply_text(text, parse_mode=ParseMode.HTML)
 
 
 async def show_profile_reply(msg, store: Store, user_id: int) -> None:
@@ -935,7 +980,7 @@ async def delete_recipe_reply(msg, store: Store, user_id: int, name: str) -> Non
 QUICK_REPLIES = {"today": today_reply, "week": week_reply, "undo": undo_reply,
                  "help": help_reply, "recipes": recipes_reply, "health": health_reply,
                  "reminders": reminders_reply, "weekly_settings": weekly_settings_reply,
-                 "profile": show_profile_reply}
+                 "profile": show_profile_reply, "setup": setup_reply}
 
 
 # ---- access and errors ------------------------------------------------------
