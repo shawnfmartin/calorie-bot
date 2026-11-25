@@ -21,6 +21,8 @@ log = logging.getLogger(__name__)
 
 REMINDER_WINDOW = timedelta(hours=2)
 BUILT_IN_DEFAULTS = {"breakfast": "10:30", "lunch": "14:30", "dinner": "20:30"}
+WEEKLY_WINDOW = timedelta(hours=12)
+SUNDAY = 6
 TIME_RE = re.compile(r"^([01]?\d|2[0-3]):([0-5]\d)$")
 
 MESSAGES = {
@@ -45,6 +47,25 @@ def default_reminders() -> dict[str, str | None]:
         if meal in out and TIME_RE.match(when):
             out[meal] = normalize_time(when)
     return out
+
+
+def default_weekly() -> str | None:
+    """WEEKLY_SUMMARY in .env: a Sunday time like "09:00" (the default), or "off"."""
+    raw = os.environ.get("WEEKLY_SUMMARY", "").strip()
+    if raw.lower() in ("off", "none", "0", "false"):
+        return None
+    return normalize_time(raw) if TIME_RE.match(raw) else "09:00"
+
+
+def weekly_due(store: Store, user_id: int, now: datetime) -> bool:
+    """Sunday, past the person's weekly-summary time, and not sent yet today."""
+    if now.weekday() != SUNDAY or store.reminder_done(user_id, now.date(), "weekly"):
+        return False
+    when = store.get_reminders(user_id, {"weekly": default_weekly()})["weekly"]
+    if not when:
+        return False
+    at = datetime.combine(now.date(), datetime.strptime(when, "%H:%M").time(), now.tzinfo)
+    return at <= now < at + WEEKLY_WINDOW
 
 
 def normalize_time(value: str) -> str:
@@ -115,4 +136,28 @@ async def send_due(app, store: Store, user_ids: list[int], now: datetime) -> lis
                 memory.add(user_id, "Bot", MESSAGES[meal])
             log.info("Sent %s reminder to %s", meal, user_id)
             sent.append((user_id, meal))
+        if weekly_due(store, user_id, now):
+            store.mark_reminder(user_id, now.date(), "weekly", "sent")
+            if await send_weekly(app, store, user_id, now):
+                sent.append((user_id, "weekly"))
     return sent
+
+
+async def send_weekly(app, store: Store, user_id: int, now: datetime) -> bool:
+    """The Sunday summary: the 7 finished days before today."""
+    from . import summary  # matplotlib loads only when a chart is actually drawn
+    s = summary.build(store, user_id, now.date() - timedelta(days=1))
+    if not s.complete and not s.left_out:
+        return False  # nothing logged all week: say nothing
+    try:
+        if s.complete:
+            png = await asyncio.to_thread(summary.chart_png, s)
+            await app.bot.send_photo(chat_id=user_id, photo=png,
+                                     caption=summary.caption(s, weekly=True), parse_mode="HTML")
+        else:
+            await app.bot.send_message(chat_id=user_id, text=summary.empty_text(s))
+    except Exception as e:
+        log.warning("Couldn't send the weekly summary to %s: %s", user_id, e)
+        return False
+    log.info("Sent the weekly summary to %s", user_id)
+    return True

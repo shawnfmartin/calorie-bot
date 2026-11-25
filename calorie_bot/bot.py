@@ -26,7 +26,7 @@ from telegram.ext import Application, ContextTypes, MessageHandler, filters
 from .db import MEALS, Entry, Recipe, Store, meal_for_time
 from .health import pending_days, start_server, sync_link
 from .nutrition import EstimateError, make_estimator
-from . import reminders
+from . import reminders, summary
 
 log = logging.getLogger("calorie_bot")
 
@@ -41,6 +41,7 @@ Just talk to me. Some things you can say:
    · <i>undo</i>
 🎯 <i>set my goal to 2000</i> · <i>what's my goal?</i>
 ❤️ <i>set up Apple Health</i> (sends each finished day to the Health app)
+📊 <i>summary</i> (a chart of your last 7 days; one also comes every Sunday)
 ⏰ <i>remind me about lunch at 1pm</i> · <i>no breakfast reminders</i> · <i>I skipped lunch</i>
    (I remind you once if a meal isn't logged by its time)
 
@@ -132,22 +133,6 @@ def today_text(store: Store, user_id: int) -> str:
     return day_text(store, user_id, 0)
 
 
-def week_text(store: Store, user_id: int) -> str:
-    days = store.totals_by_day(user_id, 7)
-    goal = store.get_goal(user_id)
-    scale = max([goal or 0] + [t for _, t in days]) or 1
-    lines = ["<b>Last 7 days</b>", "<pre>"]
-    for d, total in days:
-        lines.append(f"{d:%a %d} {total:>6,} {'█' * round(12 * total / scale)}")
-    lines.append("</pre>")
-    logged = [t for _, t in days if t]
-    if logged:
-        lines.append(f"Average (days logged): {fmt_kcal(sum(logged) / len(logged))} kcal")
-    if goal:
-        lines.append(f"Goal: {fmt_kcal(goal)} kcal")
-    return "\n".join(lines)
-
-
 def today_log_for_claude(store: Store, user_id: int) -> list[str]:
     return [f"#{e.id} {e.eaten_at:%H:%M} {e.meal}: {e.item} ({fmt_kcal(e.calories)} kcal)"
             for e in store.entries_for_day(user_id, store.today())]
@@ -184,6 +169,10 @@ class RecordingMessage:
         self._memory.add(self._user_id, "Bot", text)
         return await self._msg.reply_text(text, **kwargs)
 
+    async def reply_photo(self, photo, caption: str = "", **kwargs):
+        self._memory.add(self._user_id, "Bot", "[chart] " + caption)
+        return await self._msg.reply_photo(photo, caption=caption, **kwargs)
+
     def __getattr__(self, name):
         return getattr(self._msg, name)
 
@@ -208,7 +197,10 @@ def normalize(text: str) -> str:
 QUICK = {
     "today": {"today", "log", "my log", "today's log", "todays log", "what did i eat today",
               "what have i eaten today", "how many calories left", "calories left", "summary"},
-    "week": {"week", "this week", "my week", "last 7 days", "weekly"},
+    "week": {"week", "this week", "my week", "last 7 days", "weekly", "summary", "my summary",
+             "give summary", "give me a summary", "give me summary", "weekly summary",
+             "week summary", "show summary", "graph", "chart", "show my graph"},
+    "weekly_settings": {"weekly summary settings"},
     "undo": {"undo", "undo that", "undo last", "scratch that"},
     "help": {"help", "start", "what can you do", "how does this work", "commands", "menu"},
     "recipes": {"recipes", "my recipes", "list recipes", "show recipes", "show my recipes"},
@@ -366,6 +358,9 @@ async def claude_reply(update, ctx, msg, store: Store, user_id: int, text: str,
         await help_reply(msg, store, user_id)
     elif intent == "apple_health":
         await health_reply(msg, store, user_id)
+    elif intent == "set_weekly_summary":
+        await weekly_settings_reply(msg, store, user_id,
+                                    (result.get("reminder_time") or "").strip().lower())
     elif intent == "set_reminders":
         await set_reminders_reply(msg, store, user_id, meal,
                                   (result.get("reminder_time") or "").strip().lower())
@@ -481,7 +476,33 @@ async def today_reply(msg, store: Store, user_id: int) -> None:
 
 
 async def week_reply(msg, store: Store, user_id: int) -> None:
-    await msg.reply_text(week_text(store, user_id), parse_mode=ParseMode.HTML)
+    """The last 7 days (today included) as a line chart of complete days."""
+    s = summary.build(store, user_id, store.today())
+    if not s.complete:
+        await msg.reply_text(summary.empty_text(s))
+        return
+    png = await asyncio.to_thread(summary.chart_png, s)  # drawing takes a moment on a Pi
+    await msg.reply_photo(png, caption=summary.caption(s), parse_mode=ParseMode.HTML)
+
+
+def weekly_text(store: Store, user_id: int) -> str:
+    when = store.get_reminders(user_id, {"weekly": reminders.default_weekly()})["weekly"]
+    state = f"on, Sundays at {reminders.fmt_time(when)}" if when else "off"
+    return (f"📊 Weekly summary: {state}. It charts your last 7 finished days.\n"
+            "Change it: “send my weekly summary at 6pm”, “turn off the weekly summary”.")
+
+
+async def weekly_settings_reply(msg, store: Store, user_id: int, value: str = "") -> None:
+    if value == "off":
+        store.set_reminders(user_id, {"weekly": None})
+    elif value == "on":
+        store.set_reminders(user_id, {"weekly": reminders.default_weekly() or "09:00"})
+    elif value:
+        if not reminders.TIME_RE.match(value):
+            await msg.reply_text("I didn't catch the time. Try e.g. “send my weekly summary at 6pm”.")
+            return
+        store.set_reminders(user_id, {"weekly": reminders.normalize_time(value)})
+    await msg.reply_text(weekly_text(store, user_id))
 
 
 async def help_reply(msg, store: Store, user_id: int) -> None:
@@ -774,7 +795,7 @@ async def delete_recipe_reply(msg, store: Store, user_id: int, name: str) -> Non
 
 QUICK_REPLIES = {"today": today_reply, "week": week_reply, "undo": undo_reply,
                  "help": help_reply, "recipes": recipes_reply, "health": health_reply,
-                 "reminders": reminders_reply}
+                 "reminders": reminders_reply, "weekly_settings": weekly_settings_reply}
 
 
 # ---- access and errors ------------------------------------------------------

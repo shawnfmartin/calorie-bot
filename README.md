@@ -41,6 +41,9 @@ There are no commands to learn. Everything is a normal message.
   yields, and you can replace that with a real weighing.
 - **Apple Health sync** through an iPhone Shortcut: each finished day goes in as
   calories, protein, carbs and fat per meal.
+- **7-day chart:** ask for a *"summary"* and get a line chart of your last 7 days, and
+  one arrives every Sunday. Days with a meal missing are left out, so they don't drag
+  the chart down.
 - **Meal reminders:** if breakfast, lunch or dinner isn't logged by its time, the bot
   reminds you once. Change times or turn them off in plain words.
 - **More than one person:** each person gets their own log, recipes, goal and Health link.
@@ -140,7 +143,8 @@ then run `systemctl --user restart calorie-bot`.
 | Move to another meal | *"the salad was actually dinner"* |
 | Remove an entry | *"remove the toast"*, *"undo"* |
 | Set a goal | *"set my goal to 2000"*, *"what's my goal?"*, *"no more goal"* |
-| See the week | *"how did I do this week?"* |
+| See the week (chart) | *"summary"*, *"/summary"*, *"how did I do this week?"* |
+| Weekly summary | *"send my weekly summary at 6pm"*, *"turn off the weekly summary"* |
 | Save a recipe | *"save this as my chili:"* followed by the ingredients |
 | Manage recipes | *"show my recipes"*, *"rename it to …"*, *"delete the chili recipe"* |
 | Apple Health | *"set up Apple Health"* |
@@ -171,6 +175,18 @@ Dijon chicken: 879 kcal, 706 g raw → about 545 g cooked (estimated)
 ```
 For exact numbers, weigh the finished dish once: *"the dijon chicken weighed 520 g after
 cooking"*. Say *"100g raw …"* to log a raw weight instead.
+
+### 7-day summary chart
+*"Summary"* (or `/summary`, *"show my graph"*, *"how did I do this week?"*) sends a line
+chart of the last 7 days, with your goal and average marked. The caption has your
+average, macros per day, the highest and lowest days, and how many days you were at or
+under your goal. Every Sunday at 9:00 the bot sends the same chart for the past week. Turn
+it off or move it in plain words, or for everyone with `WEEKLY_SUMMARY` in `.env`.
+
+**Only complete days are charted.** A day counts once breakfast, lunch and dinner are each
+logged, or you said you skipped one. A day with a meal missing would make it look like you
+ate less than you did, so it's left out: the line breaks there, and the caption says which
+meal was missing. Snacks are optional.
 
 ### Meal reminders
 By default the bot checks at 10:30 (breakfast), 14:30 (lunch) and 20:30 (dinner). If you
@@ -221,6 +237,7 @@ to the Pi and runs the update there. The Pi keeps its own `.env` and `data/`.
 | `CLAUDE_CODE_OAUTH_TOKEN` | Optional: a token from `claude setup-token` if the Pi's login expires |
 | `HEALTH_PORT` | Apple Health sync port, default `8787`; `0` turns it off |
 | `HEALTH_BASE_URL` | What the Health links point at; default `http://<hostname>.local:8787` |
+| `WEEKLY_SUMMARY` | Sunday summary time, default `09:00`, or `off`. Each person can change theirs |
 | `REMINDERS` | Default reminder times, e.g. `breakfast=10:30,lunch=14:30,dinner=20:30`, or `off`. Each person can change their own |
 | `DB_PATH` | Where the SQLite file lives, default `data/calories.db` |
 
@@ -255,7 +272,8 @@ python3 -m venv .venv && .venv/bin/pip install -r requirements.txt pytest
   `claude -p` with structured output, or the Anthropic API. Claude Code runs in a
   throwaway folder with no tools for text, and with only the Read tool for a photo.
 - `calorie_bot/db.py`: SQLite storage, with upgrades for older databases on startup.
-- `calorie_bot/reminders.py`: the once-a-minute reminder check.
+- `calorie_bot/reminders.py`: the once-a-minute check for meal reminders and the Sunday summary.
+- `calorie_bot/summary.py`: the 7-day summary and its matplotlib chart.
 - `calorie_bot/health.py`: the Apple Health sync endpoint (standard-library web server).
 
 ## License

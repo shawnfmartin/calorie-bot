@@ -434,7 +434,7 @@ class Chat:
         self.store = Store(tmp_path / "t.db", TZ)
         self.claude = ScriptedEstimator()
         self.ctx = NS(bot_data={"store": self.store, "estimator": self.claude}, bot=self)
-        self.replies = []
+        self.replies, self.photos = [], []
 
     async def send_chat_action(self, *a):
         pass
@@ -449,6 +449,10 @@ class Chat:
 
             async def reply_text(self, t, **k):
                 chat.replies.append(t)
+
+            async def reply_photo(self, photo, caption="", **k):
+                chat.photos.append(photo)
+                chat.replies.append(caption)
 
         m = Msg()
         m.text = text
@@ -472,7 +476,7 @@ def test_normalize():
 def test_quick_replies_skip_claude(tmp_path):
     chat = Chat(tmp_path)
     assert "Nothing logged today" in chat.say("today")
-    assert "Last 7 days" in chat.say("/week")
+    assert "No complete days" in chat.say("/week")
     assert "Just talk to me" in chat.say("/start")
     assert "/" not in chat.say("help").replace("</", "")   # help mentions no commands
     assert chat.claude.calls == []
@@ -935,3 +939,91 @@ def test_reminders_in_plain_words(tmp_path, monkeypatch):
         "set_reminders", meal="dinner", reminder_time="teatime"))
     assert "won't remind you" in chat.say("I skipped dinner", claude_says("skip_meal", meal="dinner"))
     assert chat.store.reminder_done(1, chat.store.today(), "dinner") == "skipped"
+
+
+# ---- 7-day summary and chart --------------------------------------------------------
+
+from calorie_bot import summary as summ  # noqa: E402
+
+
+def full_day(s, days_ago, kcal_each, uid=1):
+    for meal, hour in (("breakfast", 8), ("lunch", 12), ("dinner", 19)):
+        when = datetime.combine(s.today() - timedelta(days=days_ago), datetime.min.time(), TZ) \
+            + timedelta(hours=hour)
+        s.add_items(uid, "x", [item(meal, kcal_each)], uuid4hex(), when, meal=meal)
+
+
+def test_summary_only_charts_complete_days(tmp_path):
+    s = Store(tmp_path / "t.db", TZ)
+    full_day(s, 1, 600)                                   # 1,800: complete
+    full_day(s, 2, 700)                                   # 2,100: complete
+    log_on(s, 3, "breakfast", "eggs", 300, 8)             # only breakfast: left out
+    log_on(s, 4, "breakfast", "oats", 300, 8)             # breakfast + lunch, dinner skipped
+    log_on(s, 4, "lunch", "salad", 400, 12)
+    s.mark_reminder(1, s.today() - timedelta(days=4), "dinner", "skipped")
+    s.set_goal(1, 2000)
+    out = summ.build(s, 1, s.today())
+    assert sorted(d.kcal for d in out.complete) == [700, 1800, 2100]   # the skipped day counts
+    assert [(d, m) for d, m in out.left_out] == [(s.today() - timedelta(days=3), ["lunch", "dinner"])]
+    assert round(out.average) == 1533
+    cap = summ.caption(out)
+    assert "1,533 kcal</b>/day over 3 complete days" in cap
+    assert "no lunch or dinner" in cap and "2,000 goal on 2 of 3 days" in cap
+    png = summ.chart_png(out)
+    assert png[:8] == b"\x89PNG\r\n\x1a\n" and len(png) > 10_000
+
+
+def test_summary_with_nothing_complete(tmp_path):
+    s = Store(tmp_path / "t.db", TZ)
+    log_on(s, 1, "lunch", "salad", 400, 12)
+    out = summ.build(s, 1, s.today())
+    assert out.complete == [] and "No complete days" in summ.empty_text(out)
+    assert "no breakfast or dinner" in summ.empty_text(out)
+
+
+def test_summary_request_sends_a_photo(tmp_path):
+    chat = Chat(tmp_path)
+    full_day(chat.store, 1, 500)
+    assert "Last 7 days" in chat.say("give me a summary")          # instant, no Claude
+    assert chat.photos and chat.photos[0][:4] == b"\x89PNG" and chat.claude.calls == []
+    chat.say("how did I do this week?", claude_says("show_week"))
+    assert len(chat.photos) == 2
+
+
+class PhotoApp(FakeApp):
+    async def send_photo(self, chat_id, photo, caption, parse_mode=None):
+        self.sent.append((chat_id, "photo:" + caption))
+
+
+def test_weekly_summary_on_sunday_once(tmp_path, monkeypatch):
+    monkeypatch.delenv("WEEKLY_SUMMARY", raising=False)
+    monkeypatch.setenv("REMINDERS", "off")
+    s = Store(tmp_path / "t.db", TZ)
+    full_day(s, 1, 600)
+    app = PhotoApp(s)
+    today = s.today()
+    sunday = today + timedelta(days=(6 - today.weekday()) % 7)
+    monday = sunday + timedelta(days=1)
+    at_time = lambda d, h: datetime.combine(d, datetime.min.time(), TZ) + timedelta(hours=h)
+    assert not rem.weekly_due(s, 1, at_time(monday, 10))
+    assert not rem.weekly_due(s, 1, at_time(sunday, 8))
+    assert rem.weekly_due(s, 1, at_time(sunday, 9))
+    assert not rem.weekly_due(s, 1, at_time(sunday, 22))            # past the 12-hour window
+    # Sending on a Sunday: data must be in the week before it, so log on the Saturday.
+    full_day(s, (today - (sunday - timedelta(days=1))).days, 650)
+    asyncio.run(rem.send_due(app, s, [1], at_time(sunday, 9.5)))
+    asyncio.run(rem.send_due(app, s, [1], at_time(sunday, 10)))
+    weekly = [t for _, t in app.sent if t.startswith("photo:")]
+    assert len(weekly) == 1 and "Your week" in weekly[0]
+
+
+def test_weekly_summary_settings(tmp_path, monkeypatch):
+    monkeypatch.delenv("WEEKLY_SUMMARY", raising=False)
+    chat = Chat(tmp_path)
+    chat.store.set_reminders(1, {"lunch": "13:00"})
+    assert "on, Sundays at 9:00 AM" in chat.say("weekly summary settings")
+    assert "off" in chat.say("no weekly summary", claude_says("set_weekly_summary", reminder_time="off"))
+    assert "6:00 PM" in chat.say("send it at 6pm", claude_says("set_weekly_summary", reminder_time="18:00"))
+    assert chat.store.get_reminders(1, rem.default_reminders())["lunch"] == "13:00"  # kept
+    monkeypatch.setenv("WEEKLY_SUMMARY", "off")
+    assert rem.default_weekly() is None

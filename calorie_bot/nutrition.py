@@ -101,7 +101,11 @@ Set `intent` to exactly one of:
   or at one meal ("what did I have for lunch today?", "what did I eat yesterday?"). Set
   `day_offset` (0 today, -1 yesterday, -2 the day before, up to -30) and `meal` to the meal
   they asked about, or "" for the whole day.
-- "show_week": the user wants to see the last few days or their weekly progress.
+- "show_week": the user wants a summary, chart or graph of the last 7 days, or their weekly
+  progress ("give me a summary", "how did I do this week?", "show my graph").
+- "set_weekly_summary": the user is turning the Sunday weekly summary on or off, changing its
+  time, or asking about it. Set `reminder_time` to "on", "off", a 24-hour "HH:MM" for
+  Sundays, or "" if only asking.
 - "set_goal": the user is setting, changing, clearing or asking about their daily calorie goal.
   Put the new goal in `goal_kcal`; -1 to clear it; 0 if they are only asking what it is.
 - "save_recipe": the user wants to save, create, add or update a recipe for later (e.g. "make a
@@ -185,7 +189,7 @@ _RECIPE_KEYS = list(_RECIPE_PROPS)
 
 INTENTS = ["log_meal", "correct_log", "move_entries", "delete_entries", "undo_last", "show_day",
            "show_week",
-           "set_goal", "apple_health", "set_reminders", "skip_meal", "save_recipe", "update_recipe", "rename_recipe", "show_recipe",
+           "set_goal", "apple_health", "set_reminders", "set_weekly_summary", "skip_meal", "save_recipe", "update_recipe", "rename_recipe", "show_recipe",
            "list_recipes", "delete_recipe", "help", "other"]
 
 MEAL_SCHEMA = {

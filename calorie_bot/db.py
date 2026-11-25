@@ -358,13 +358,19 @@ class Store:
         row = self.conn.execute("SELECT reminders FROM settings WHERE user_id=?",
                                 (user_id,)).fetchone()
         saved = json.loads(row["reminders"]) if row and row["reminders"] else {}
-        return {meal: saved.get(meal, defaults.get(meal)) for meal in REMINDER_MEALS}
+        keys = defaults.keys() if set(defaults) - set(REMINDER_MEALS) else REMINDER_MEALS
+        return {key: saved.get(key, defaults.get(key)) for key in keys}
 
     def set_reminders(self, user_id: int, reminders: dict[str, str | None]) -> None:
+        """Save the given keys, keeping any others already saved (e.g. "weekly")."""
+        row = self.conn.execute("SELECT reminders FROM settings WHERE user_id=?",
+                                (user_id,)).fetchone()
+        saved = json.loads(row["reminders"]) if row and row["reminders"] else {}
+        saved.update(reminders)
         self.conn.execute(
             "INSERT INTO settings (user_id, reminders) VALUES (?, ?)"
             " ON CONFLICT(user_id) DO UPDATE SET reminders=excluded.reminders",
-            (user_id, json.dumps(reminders)))
+            (user_id, json.dumps(saved)))
         self.conn.commit()
 
     def reminder_done(self, user_id: int, day: date, meal: str) -> str | None:
